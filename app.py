@@ -4,7 +4,6 @@ HR ATTENDANCE ANALYTICS DASHBOARD
 ================================================================================
 A complete end-to-end data pipeline for HR attendance analysis with
 interactive Streamlit dashboard for management decision-making.
-
 Author: HR Analytics Team
 Version: 1.0
 Date: 2025
@@ -1540,7 +1539,7 @@ def main():
     # ------------------------------------------------------------------------
     # TAB 7: ANOMALY DASHBOARD
     # ------------------------------------------------------------------------
-    with tab4:
+    with tab7:
         st.subheader("Anomaly Detection & Analysis")
         
         # Anomaly summary
