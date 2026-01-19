@@ -52,7 +52,10 @@ class Config:
         'Breanne': 'Nurse practitioner',
         'Stacey': 'Nurse practitioner',
         'Allison': 'Nurse practitioner',
-        'Jaime': 'Nurse practitioner'
+        'Jaime': 'Nurse practitioner',
+        'Natalie': 'Front Desk',
+        'Roshon': 'Mid Office',
+        'Susan': 'Nurse practitioner'
     }
     
     # Business hours configuration
@@ -440,6 +443,43 @@ class FeatureEngineer:
         )
         
         return daily_df
+
+# ============================================================================
+# PHASE 3: DATA PERSISTENCE
+# ============================================================================
+
+class DataManager:
+    """Handles data persistence and file management"""
+    
+    @staticmethod
+    def merge_and_save(uploaded_file, target_path: str):
+        """
+        Merge uploaded data with existing data and save to disk
+        """
+        try:
+            # Load new data
+            new_df = pd.read_excel(uploaded_file)
+            
+            # Check if target file exists
+            if os.path.exists(target_path):
+                try:
+                    existing_df = pd.read_excel(target_path)
+                    # Combine datasets
+                    combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                    # Remove exact duplicates
+                    combined_df = combined_df.drop_duplicates()
+                except Exception:
+                    combined_df = new_df
+            else:
+                combined_df = new_df
+            
+            # Save merged data
+            combined_df.to_excel(target_path, index=False)
+            return True
+            
+        except Exception as e:
+            st.error(f"Error saving data: {str(e)}")
+            return False
 
 # ============================================================================
 # DATA LOADING & PROCESSING PIPELINE
@@ -906,11 +946,11 @@ def main():
     
     data_source = None
     
-    # 1. Handle new file upload (Overwrite existing)
+    # 1. Handle new file upload (Append/Refresh)
     if uploaded_file is not None:
-        with open(Config.DATA_FILE_PATH, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        st.sidebar.success("✅ Data updated! Refreshing...")
+        with st.spinner("🔄 Merging and updating data..."):
+            DataManager.merge_and_save(uploaded_file, Config.DATA_FILE_PATH)
+        st.sidebar.success("✅ Data updated successfully!")
         st.cache_data.clear()
         data_source = Config.DATA_FILE_PATH
     # 2. Check for existing persistent file
