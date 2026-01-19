@@ -21,6 +21,7 @@ from datetime import datetime, time, timedelta
 from typing import Tuple, Dict, List
 import calendar
 import warnings
+import os
 warnings.filterwarnings('ignore')
 
 # ============================================================================
@@ -29,6 +30,31 @@ warnings.filterwarnings('ignore')
 
 class Config:
     """Centralized configuration for business rules and thresholds"""
+    
+    # Persistent Storage
+    DATA_FILE_PATH = "attendance_data.xlsx"
+    
+    # Department Auto-Mapping
+    DEPARTMENT_MAPPING = {
+        'Keyra': 'ex employees',
+        'Brianna': 'Nurse practitioner',
+        'Candice': 'Counselors',
+        'Brenda': 'Mid Office',
+        'Megan': 'Front Desk',
+        'Heather': 'Mid Office',
+        'Shelbie': 'ex employees',
+        'Brittany': 'Mid Office',
+        'Dasha': 'Front Desk',
+        'Mhykeisha': 'Nurse practitioner',
+        'Kenyelle': 'Mid Office',
+        'Jasmine': 'Mid Office',
+        'Courtney': 'ex employees',
+        'Jazmine': 'Mid Office',
+        'Breanne': 'Nurse practitioner',
+        'Stacey': 'Nurse practitioner',
+        'Allison': 'Nurse practitioner',
+        'Jaime': 'Nurse practitioner'
+    }
     
     # Business hours configuration
     STANDARD_START_TIME = time(8, 0)      # 8:00 AM
@@ -56,6 +82,22 @@ class Config:
 class DataCleaner:
     """Handles all data cleaning and standardization operations"""
     
+    @staticmethod
+    def fill_missing_departments(df: pd.DataFrame) -> pd.DataFrame:
+        """Auto-fill missing departments based on first name mapping"""
+        if 'Department' not in df.columns:
+            df['Department'] = np.nan
+            
+        def get_dept(row):
+            curr = row.get('Department')
+            if pd.notna(curr) and str(curr).strip() not in ['', 'nan', 'None', 'Unknown']:
+                return curr
+            fname = str(row.get('Employee First Name', '')).strip().title()
+            return Config.DEPARTMENT_MAPPING.get(fname, 'Unknown')
+            
+        df['Department'] = df.apply(get_dept, axis=1)
+        return df
+
     @staticmethod
     def standardize_names(df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -417,6 +459,7 @@ def load_and_process_data(uploaded_file) -> Tuple[pd.DataFrame, pd.DataFrame, pd
         # Phase 1: Data Cleaning
         cleaner = DataCleaner()
         raw_df = cleaner.standardize_names(raw_df)
+        raw_df = cleaner.fill_missing_departments(raw_df)
         raw_df = cleaner.clean_datetime_columns(raw_df)
         raw_df = cleaner.detect_duplicates(raw_df)
         raw_df = cleaner.create_data_quality_flags(raw_df)
@@ -857,17 +900,31 @@ def main():
     st.markdown("**Complete workforce attendance insights for data-driven HR decisions**")
     st.markdown("---")
     
-    # FILE UPLOAD SECTION
-    st.subheader("📁 Upload Attendance Data")
-    uploaded_file = st.file_uploader("Choose an Excel file", type=['xlsx', 'xls'])
+    # FILE MANAGEMENT & PERSISTENCE
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📁 Data Management")
+    uploaded_file = st.sidebar.file_uploader("Update Data Source", type=['xlsx', 'xls'])
     
-    if uploaded_file is None:
-        st.info("Please upload an Excel file to proceed.")
+    data_source = None
+    
+    # 1. Handle new file upload (Overwrite existing)
+    if uploaded_file is not None:
+        with open(Config.DATA_FILE_PATH, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        st.sidebar.success("✅ Data updated! Refreshing...")
+        st.cache_data.clear()
+        data_source = Config.DATA_FILE_PATH
+    # 2. Check for existing persistent file
+    elif os.path.exists(Config.DATA_FILE_PATH):
+        data_source = Config.DATA_FILE_PATH
+    
+    if data_source is None:
+        st.info("👋 Welcome! Please upload an Excel file in the sidebar to initialize the dashboard.")
         st.stop()
     
     # Load data
     with st.spinner("🔄 Loading and processing attendance data..."):
-        raw_df, daily_df, emp_metrics_df = load_and_process_data(uploaded_file)
+        raw_df, daily_df, emp_metrics_df = load_and_process_data(data_source)
     
     # ========================================================================
     # SIDEBAR CONTROLS
