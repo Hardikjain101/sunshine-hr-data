@@ -60,14 +60,26 @@ class Config:
     
     # Business hours configuration
     STANDARD_START_TIME = time(8, 0)      # 8:00 AM
+    LATE_GRACE_PERIOD_END = time(8, 8)    # 8:08 AM
+    VERY_LATE_THRESHOLD = time(8, 15)     # 8:15 AM
     STANDARD_END_TIME = time(17, 0)       # 5:00 PM
-    EARLY_DEPARTURE_TIME = time(16, 0)    # 4:00 PM
+    
+    # Early Departure Times
+    EARLY_DEPARTURE_TIME_MON_THU = time(16, 30) # 4:30 PM
+    EARLY_DEPARTURE_TIME_FRI = time(12, 15)   # 12:15 PM
+    
+    # Friday Full Day Threshold
+    FRIDAY_FULL_DAY_PUNCH_OUT = time(12, 15) # 12:15 PM
     
     # Working hours thresholds
     MIN_WORK_HOURS = 4.0                   # Minimum daily hours
     MAX_WORK_HOURS = 10.0                  # Maximum reasonable hours
     HALF_DAY_THRESHOLD = 5.0               # Hours for half-day
     FULL_DAY_THRESHOLD = 8.0               # Hours for full-day
+    
+    # Overtime thresholds
+    WEEKLY_STANDARD_HOURS = 40.0           # Weekly standard hours
+    MONTHLY_STANDARD_HOURS = 160.0         # Monthly standard hours
     
     # Anomaly detection
     DUPLICATE_THRESHOLD_MINUTES = 5        # Minutes to detect duplicates
@@ -235,11 +247,12 @@ class FeatureEngineer:
         Calculate daily attendance metrics per employee
         Returns: Daily summary DataFrame
         """
-        # Filter valid records
+        # Filter valid records and exclude weekends
         valid_df = df[
             (~df['Missing Timestamp']) & 
             (~df['Incomplete Employee Record']) &
-            (~df['Duplicate Punch'])
+            (~df['Duplicate Punch']) &
+            (~df['Day of Week'].isin(['Saturday', 'Sunday']))
         ].copy()
         
         # Group by employee and date
@@ -309,47 +322,85 @@ class FeatureEngineer:
     @staticmethod
     def add_compliance_metrics(daily_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Add compliance-related flags and metrics
+        Add compliance-related flags and metrics based on updated business rules.
         """
-        # Late arrival (after standard start time)
-        daily_df['Is Late'] = daily_df['First Punch In'].dt.time > Config.STANDARD_START_TIME
-        daily_df['Minutes Late'] = daily_df.apply(
-            lambda row: max(0, (
-                datetime.combine(datetime.today(), row['First Punch In'].time()) -
-                datetime.combine(datetime.today(), Config.STANDARD_START_TIME)
-            ).total_seconds() / 60) if row['Is Late'] else 0,
-            axis=1
-        )
-        
-        # Early departure (before 4:00 PM)
-        daily_df['Is Early Departure'] = daily_df['Last Punch Out'].dt.time < Config.EARLY_DEPARTURE_TIME
-        daily_df['Minutes Early'] = daily_df.apply(
-            lambda row: max(0, (
-                datetime.combine(datetime.today(), Config.EARLY_DEPARTURE_TIME) -
-                datetime.combine(datetime.today(), row['Last Punch Out'].time())
-            ).total_seconds() / 60) if row['Is Early Departure'] else 0,
-            axis=1
-        )
-        
-        # Shift classification
-        daily_df['Shift Type'] = daily_df['Working Hours'].apply(
-            lambda x: 'Full Day' if x >= Config.FULL_DAY_THRESHOLD 
-            else 'Half Day' if x >= Config.HALF_DAY_THRESHOLD 
-            else 'Short Shift'
-        )
-        
-        # Missing punch flags - HR-accurate logic
-        # Missing punch-out: Only when first punch == last punch (single punch, no exit)
-        # OR when there's only one punch and it's clearly incomplete
+        if daily_df.empty:
+            return daily_df
+
+        def apply_compliance_rules(row):
+            # ===================
+            # Late Arrival Logic
+            # ===================
+            punch_in_time = row['First Punch In'].time()
+            is_late = punch_in_time > Config.LATE_GRACE_PERIOD_END
+            is_very_late = punch_in_time > Config.VERY_LATE_THRESHOLD
+            
+            minutes_late = 0
+            if is_late:
+                minutes_late = max(0, (
+                    datetime.combine(datetime.today(), punch_in_time) -
+                    datetime.combine(datetime.today(), Config.STANDARD_START_TIME)
+                ).total_seconds() / 60)
+
+            # =======================
+            # Early Departure Logic
+            # =======================
+            day_of_week = row['Day of Week']
+            punch_out_time = row['Last Punch Out'].time()
+            
+            if day_of_week == 'Friday':
+                early_departure_threshold = Config.EARLY_DEPARTURE_TIME_FRI
+            else:
+                early_departure_threshold = Config.EARLY_DEPARTURE_TIME_MON_THU
+
+            is_early_departure = punch_out_time < early_departure_threshold
+            
+            minutes_early = 0
+            if is_early_departure:
+                minutes_early = max(0, (
+                    datetime.combine(datetime.today(), early_departure_threshold) -
+                    datetime.combine(datetime.today(), punch_out_time)
+                ).total_seconds() / 60)
+
+            # ========================
+            # Shift Classification
+            # ========================
+            working_hours = row['Working Hours']
+            shift_type = 'Short Shift' # Default
+            if day_of_week == 'Friday':
+                # Friday is a full day if they punch out after the designated time
+                if punch_out_time >= Config.FRIDAY_FULL_DAY_PUNCH_OUT:
+                    shift_type = 'Full Day'
+                else:
+                    shift_type = 'Short Shift' # Or could be another category if needed
+            else:
+                # Standard weekday logic
+                if working_hours >= Config.FULL_DAY_THRESHOLD:
+                    shift_type = 'Full Day'
+                elif working_hours >= Config.HALF_DAY_THRESHOLD:
+                    shift_type = 'Half Day'
+
+            return pd.Series([
+                is_late, is_very_late, minutes_late,
+                is_early_departure, minutes_early,
+                shift_type
+            ])
+
+        # Apply rules
+        daily_df[[
+            'Is Late', 'Is Very Late', 'Minutes Late',
+            'Is Early Departure', 'Minutes Early',
+            'Shift Type'
+        ]] = daily_df.apply(apply_compliance_rules, axis=1)
+
+        # ========================
+        # Missing Punch Logic
+        # ========================
         daily_df['Missing Punch Out'] = (
-            (daily_df['First Punch In'] == daily_df['Last Punch Out']) &  # Same timestamp = single punch
-            (daily_df['Punch Count'] == 1)  # Only one punch total
+            (daily_df['First Punch In'] == daily_df['Last Punch Out']) &
+            (daily_df['Punch Count'] == 1)
         )
-        
-        # Missing punch-in: Should be very rare, only if no punches at all (handled by has_punch_in)
         daily_df['Missing Punch In'] = ~daily_df['Has Punch In']
-        
-        # Odd punch count (useful for anomaly detection but not necessarily a missing punch-out)
         daily_df['Odd Punch Count'] = daily_df['Punch Count'] % 2 != 0
         
         return daily_df
@@ -444,6 +495,67 @@ class FeatureEngineer:
         
         return daily_df
 
+    @staticmethod
+    def calculate_overtime_metrics(daily_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Calculate weekly and monthly overtime metrics.
+        """
+        if daily_df.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
+        # Ensure 'Date' is datetime
+        daily_df['Date'] = pd.to_datetime(daily_df['Date'])
+
+        # Weekly Overtime
+        weekly_df = daily_df.copy()
+        weekly_df['Week'] = weekly_df['Date'].dt.isocalendar().week
+        weekly_df['Year'] = weekly_df['Date'].dt.year
+        
+        weekly_hours = weekly_df.groupby(['Employee Full Name', 'Year', 'Week'])['Working Hours'].sum().reset_index()
+        weekly_hours['Weekly Overtime'] = weekly_hours['Working Hours'] - Config.WEEKLY_STANDARD_HOURS
+        weekly_hours['Weekly Overtime'] = weekly_hours['Weekly Overtime'].clip(lower=0)
+        
+        # Monthly Overtime
+        monthly_df = daily_df.copy()
+        monthly_df['Month'] = monthly_df['Date'].dt.month
+        monthly_df['Year'] = monthly_df['Date'].dt.year
+
+        monthly_hours = monthly_df.groupby(['Employee Full Name', 'Year', 'Month'])['Working Hours'].sum().reset_index()
+        monthly_hours['Monthly Overtime'] = monthly_hours['Working Hours'] - Config.MONTHLY_STANDARD_HOURS
+        monthly_hours['Monthly Overtime'] = monthly_hours['Monthly Overtime'].clip(lower=0)
+
+        return weekly_hours, monthly_hours
+
+def plot_overtime_charts(overtime_df: pd.DataFrame, time_period: str, top_n: int = 15):
+    """
+    Create bar chart for weekly or monthly overtime from a pre-filtered DataFrame.
+    """
+    if overtime_df.empty or f'{time_period.capitalize()} Overtime' not in overtime_df.columns:
+        return None
+    
+    overtime_col = f'{time_period.capitalize()} Overtime'
+    
+    # Filter for entries with actual overtime and get the top N
+    overtime_df = overtime_df[overtime_df[overtime_col] > 0]
+    top_performers = overtime_df.nlargest(top_n, overtime_col)
+    
+    if top_performers.empty:
+        return None
+
+    fig = px.bar(
+        top_performers,
+        x=overtime_col,
+        y='Employee Full Name',
+        orientation='h',
+        title=f'Top {top_n} Employees by {time_period.capitalize()} Overtime',
+        labels={overtime_col: 'Overtime Hours', 'Employee Full Name': 'Employee'},
+        color=overtime_col,
+        color_continuous_scale='Plasma'
+    )
+    fig.update_layout(height=400, showlegend=False, yaxis={'categoryorder':'total ascending'})
+    return fig
+
+
 # ============================================================================
 # PHASE 3: DATA PERSISTENCE
 # ============================================================================
@@ -486,10 +598,10 @@ class DataManager:
 # ============================================================================
 
 @st.cache_data(show_spinner=False)
-def load_and_process_data(uploaded_file) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_and_process_data(uploaded_file) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Complete data processing pipeline
-    Returns: (raw_df, daily_df, employee_metrics_df)
+    Returns: (raw_df, daily_df, employee_metrics_df, weekly_overtime_df, monthly_overtime_df)
     """
     try:
         # Load data
@@ -507,17 +619,24 @@ def load_and_process_data(uploaded_file) -> Tuple[pd.DataFrame, pd.DataFrame, pd
         # Phase 2: Feature Engineering
         engineer = FeatureEngineer()
         daily_df = engineer.calculate_daily_attendance(raw_df)
+        if daily_df.empty:
+            st.warning("No valid attendance data found in the provided file for weekdays.")
+            return None, None, None, None, None
+
         daily_df = engineer.add_compliance_metrics(daily_df)
         daily_df = engineer.detect_anomalies(daily_df)
         
         # Employee-level metrics
         emp_metrics_df = engineer.calculate_productivity_metrics(daily_df)
+
+        # Overtime metrics
+        weekly_overtime_df, monthly_overtime_df = engineer.calculate_overtime_metrics(daily_df)
         
-        return raw_df, daily_df, emp_metrics_df
+        return raw_df, daily_df, emp_metrics_df, weekly_overtime_df, monthly_overtime_df
         
     except Exception as e:
         st.error(f"Error loading data: {str(e)}")
-        return None, None, None
+        return None, None, None, None, None
 
 # ============================================================================
 # VISUALIZATION FUNCTIONS
@@ -676,16 +795,19 @@ def calculate_attendance_distribution(daily_df: pd.DataFrame, employee_name: str
     
     # Categorize each day
     def categorize_day(row):
-        hours = row['Working Hours']
+        # Use Shift Type from compliance logic to ensure Friday Full Days are counted correctly
+        shift_type = row.get('Shift Type', 'Absent')
         has_anomaly = row.get('Has Anomaly', False)
         
         if has_anomaly:
             return 'Anomaly'
-        elif hours >= Config.FULL_DAY_THRESHOLD:
+        elif shift_type == 'Full Day':
             return 'Full Day'
-        elif hours >= Config.HALF_DAY_THRESHOLD:
+        elif shift_type == 'Half Day':
             return 'Half Day'
-        elif hours > 0:
+        elif shift_type == 'Short Shift':
+            return 'Short Day'
+        elif row['Working Hours'] > 0:
             return 'Short Day'
         else:
             return 'Absent'
@@ -711,8 +833,7 @@ def calculate_attendance_distribution(daily_df: pd.DataFrame, employee_name: str
 
 def create_attendance_calendar(daily_df: pd.DataFrame, employee_name: str, year: int, month: int):
     """
-    Create a calendar view for employee attendance in a specific month
-    Returns HTML calendar string for Streamlit
+    Create a calendar view for employee attendance in a specific month, with updated business logic.
     """
     # Filter to employee and month
     emp_df = daily_df[daily_df['Employee Full Name'] == employee_name].copy()
@@ -726,52 +847,7 @@ def create_attendance_calendar(daily_df: pd.DataFrame, employee_name: str, year:
     month_days = cal.monthdayscalendar(year, month)
     
     # Create date mapping
-    date_status = {}
-    for _, row in emp_df.iterrows():
-        day = row['Date'].day
-        hours = row['Working Hours']
-        has_anomaly = row.get('Has Anomaly', False)
-        
-        # Determine status
-        if hours >= Config.FULL_DAY_THRESHOLD:
-            status = 'full'  # Green
-        elif hours >= Config.HALF_DAY_THRESHOLD:
-            status = 'half'  # Yellow
-        elif hours > 0:
-            status = 'short'  # Orange
-        else:
-            status = 'absent'  # Red
-        
-        if has_anomaly:
-            status = 'anomaly'
-        
-        # Get punch times
-        first_punch = row.get('First Punch In', None)
-        last_punch = row.get('Last Punch Out', None)
-        
-        # Format times for display
-        in_time = None
-        out_time = None
-        if pd.notna(first_punch):
-            if isinstance(first_punch, pd.Timestamp):
-                in_time = first_punch.strftime('%H:%M')
-            else:
-                in_time = str(first_punch)[:5] if len(str(first_punch)) >= 5 else None
-        
-        if pd.notna(last_punch):
-            if isinstance(last_punch, pd.Timestamp):
-                out_time = last_punch.strftime('%H:%M')
-            else:
-                out_time = str(last_punch)[:5] if len(str(last_punch)) >= 5 else None
-        
-        date_status[day] = {
-            'status': status,
-            'hours': hours,
-            'is_late': row.get('Is Late', False),
-            'is_early': row.get('Is Early Departure', False),
-            'in_time': in_time,
-            'out_time': out_time
-        }
+    date_status = {row['Date'].day: row for _, row in emp_df.iterrows()}
     
     # Build HTML calendar - Start with header
     month_name = calendar.month_name[month]
@@ -794,7 +870,8 @@ def create_attendance_calendar(daily_df: pd.DataFrame, employee_name: str, year:
         'half': '#FFC107',      # Yellow
         'short': '#FF9800',     # Orange
         'absent': '#F44336',    # Red
-        'anomaly': '#9C27B0'    # Purple
+        'anomaly': '#9C27B0',    # Purple
+        'weekoff': '#e0e0e0'    # Grey
     }
     
     status_labels = {
@@ -802,7 +879,8 @@ def create_attendance_calendar(daily_df: pd.DataFrame, employee_name: str, year:
         'half': '½ Half Day',
         'short': '! Short',
         'absent': '✗ Absent',
-        'anomaly': '⚠ Anomaly'
+        'anomaly': '⚠ Anomaly',
+        'weekoff': 'Week Off'
     }
     
     for week in month_days:
@@ -810,53 +888,272 @@ def create_attendance_calendar(daily_df: pd.DataFrame, employee_name: str, year:
         for day in week:
             if day == 0:
                 html += '<td style="padding: 15px; border: 1px solid #ddd; background-color: #f5f5f5;"></td>'
+                continue
+
+            # Determine weekday (0=Mon, 6=Sun)
+            current_date = datetime(year, month, day)
+            weekday = current_date.weekday()
+
+            # Handle Weekends
+            if weekday == 5 or weekday == 6: # Saturday or Sunday
+                html += f'<td style="padding: 10px; text-align: center; border: 1px solid #ddd; background-color: {colors["weekoff"]}; color: #333; font-weight: bold; min-width: 100px;">'
+                html += f'<div style="font-size: 16px; font-weight: bold;">{day}</div>'
+                html += f'<div style="font-size: 10px; margin-top: 3px;">{status_labels["weekoff"]}</div>'
+                html += '</td>'
+                continue
+
+            # Handle Weekdays
+            day_info = date_status.get(day)
+            
+            if day_info is not None:
+                status = 'absent' # Default
+                # Use Shift Type calculated in compliance logic
+                shift_type = day_info.get('Shift Type', 'Absent')
+                
+                if day_info.get('Has Anomaly', False):
+                    status = 'anomaly'
+                elif shift_type == 'Full Day':
+                    status = 'full'
+                elif shift_type == 'Half Day':
+                    status = 'half'
+                elif shift_type == 'Short Shift':
+                    status = 'short'
+                
+                hours = day_info['Working Hours']
+                bg_color = colors.get(status, '#ffffff')
+                label = status_labels.get(status, '')
+                
+                # Tooltip info
+                info = f"Status: {shift_type} | Hours: {hours:.1f}h"
+                if day_info.get('First Punch In'):
+                    info += f" | In: {day_info['First Punch In'].strftime('%H:%M')}"
+                if day_info.get('Last Punch Out'):
+                    info += f" | Out: {day_info['Last Punch Out'].strftime('%H:%M')}"
+                if day_info.get('Is Late', False):
+                    info += " | Late"
+                if day_info.get('Is Very Late', False):
+                    info += " (Very Late)"
+                if day_info.get('Is Early Departure', False):
+                    info += " | Early Departure"
+                
+                info_escaped = info.replace('"', '&quot;')
+                html += f'<td style="padding: 10px; text-align: center; border: 1px solid #ddd; background-color: {bg_color}; color: white; font-weight: bold; min-width: 100px;" title="{info_escaped}">'
+                html += f'<div style="font-size: 16px; font-weight: bold;">{day}</div>'
+                html += f'<div style="font-size: 10px; margin-top: 3px; opacity: 0.9;">{label}</div>'
+                
+                # In/Out times
+                if pd.notna(day_info.get('First Punch In')) or pd.notna(day_info.get('Last Punch Out')):
+                    html += '<div style="font-size: 9px; margin-top: 4px; line-height: 1.2; opacity: 0.85;">'
+                    if pd.notna(day_info.get('First Punch In')):
+                        html += f'<div>In: {day_info["First Punch In"].strftime("%H:%M")}</div>'
+                    if pd.notna(day_info.get('Last Punch Out')):
+                        html += f'<div>Out: {day_info["Last Punch Out"].strftime("%H:%M")}</div>'
+                    html += '</div>'
+                
+                html += '</td>'
             else:
-                day_info = date_status.get(day, None)
-                if day_info:
-                    status = day_info['status']
-                    hours = day_info['hours']
-                    bg_color = colors.get(status, '#ffffff')
-                    label = status_labels.get(status, '')
-                    
-                    # Tooltip info with in/out times
-                    info = f"Hours: {hours:.1f}h"
-                    if day_info.get('in_time'):
-                        info += f" | In: {day_info['in_time']}"
-                    if day_info.get('out_time'):
-                        info += f" | Out: {day_info['out_time']}"
-                    if day_info['is_late']:
-                        info += " | Late"
-                    if day_info['is_early']:
-                        info += " | Early"
-                    
-                    # Escape quotes in info for HTML attribute
-                    info_escaped = info.replace('"', '&quot;')
-                    html += f'<td style="padding: 10px; text-align: center; border: 1px solid #ddd; background-color: {bg_color}; color: white; font-weight: bold; min-width: 100px;" title="{info_escaped}">'
-                    html += f'<div style="font-size: 16px; font-weight: bold;">{day}</div>'
-                    html += f'<div style="font-size: 10px; margin-top: 3px; opacity: 0.9;">{label}</div>'
-                    
-                    # Add In-Time and Out-Time if available
-                    if day_info.get('in_time') or day_info.get('out_time'):
-                        html += '<div style="font-size: 9px; margin-top: 4px; line-height: 1.2; opacity: 0.85;">'
-                        if day_info.get('in_time'):
-                            html += f'<div>In: {day_info["in_time"]}</div>'
-                        if day_info.get('out_time'):
-                            html += f'<div>Out: {day_info["out_time"]}</div>'
-                        html += '</div>'
-                    
-                    html += '</td>'
-                else:
-                    html += f'<td style="padding: 15px; text-align: center; border: 1px solid #ddd; background-color: #e0e0e0; color: #999;">{day}</td>'
+                # Day with no punches (absent)
+                bg_color = colors['absent']
+                label = status_labels['absent']
+                html += f'<td style="padding: 10px; text-align: center; border: 1px solid #ddd; background-color: {bg_color}; color: white; font-weight: bold; min-width: 100px;" title="Absent">'
+                html += f'<div style="font-size: 16px; font-weight: bold;">{day}</div>'
+                html += f'<div style="font-size: 10px; margin-top: 3px; opacity: 0.9;">{label}</div>'
+                html += '</td>'
+
         html += "</tr>"
     
     html += '</tbody></table>'
     html += '<div style="margin-top: 20px; padding: 15px; background-color: #f9f9f9; border-radius: 5px;">'
     html += '<div style="display: flex; flex-wrap: wrap; gap: 20px; justify-content: center;">'
-    html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #4CAF50; margin-right: 8px; border: 1px solid #ddd;"></div><span>Full Day (≥8h)</span></div>'
-    html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #FFC107; margin-right: 8px; border: 1px solid #ddd;"></div><span>Half Day (≥5h)</span></div>'
+    html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #4CAF50; margin-right: 8px; border: 1px solid #ddd;"></div><span>Full Day</span></div>'
+    html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #FFC107; margin-right: 8px; border: 1px solid #ddd;"></div><span>Half Day</span></div>'
+    html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #FF9800; margin-right: 8px; border: 1px solid #ddd;"></div><span>Short Day</span></div>'
+    html += '<div style="display: flex; align-items.center;"><div style="width: 30px; height: 20px; background-color: #F44336; margin-right: 8px; border: 1px solid #ddd;"></div><span>Absent / No Punch</span></div>'
+    html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #9C27B0; margin-right: 8px; border: 1px solid #ddd;"></div><span>Anomaly</span></div>'
+    html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #e0e0e0; margin-right: 8px; border: 1px solid #ddd;"></div><span>Week Off</span></div>'
+    html += '</div></div></div>'
+    
+    return html
+
+def create_work_pattern_calendar(daily_df: pd.DataFrame, employee_name: str, year: int, month: int):
+    """
+    Create a calendar view for employee attendance with employee-specific work patterns.
+    """
+    # Filter to employee and month
+    emp_df = daily_df[daily_df['Employee Full Name'] == employee_name].copy()
+    emp_df['Date'] = pd.to_datetime(emp_df['Date'])
+    emp_df = emp_df[(emp_df['Date'].dt.year == year) & (emp_df['Date'].dt.month == month)]
+    
+    # Employee-specific work patterns (weekday: 0=Mon, 6=Sun)
+    first_name = str(employee_name).strip().split()[0].title() if employee_name else ''
+    default_workdays = {0, 1, 2, 3, 4}
+    work_patterns = {
+        'Jaime': {'workdays': {0, 3}, 'early_departure': time(15, 0)},
+        'Susan': {'workdays': {0, 4}},
+        'Breanne': {'workdays': {1, 2, 3, 4}},
+        'Mhykeisha': {'workdays': {0, 1, 2, 3}},
+        'Candice': {'workdays': {1, 2, 3}}
+    }
+    pattern = work_patterns.get(first_name, {'workdays': default_workdays})
+    expected_workdays = pattern['workdays']
+    early_departure_override = pattern.get('early_departure')
+    
+    # Create calendar data structure
+    cal = calendar.Calendar(firstweekday=6)  # Start with Sunday
+    
+    # Get all days in the month
+    month_days = cal.monthdayscalendar(year, month)
+    
+    # Create date mapping
+    date_status = {row['Date'].day: row for _, row in emp_df.iterrows()}
+    
+    # Build HTML calendar - Start with header
+    month_name = calendar.month_name[month]
+    html = f'<div style="font-family: Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px;">'
+    html += f'<h3 style="text-align: center; color: #2E86AB; margin-bottom: 20px;">{month_name} {year} - {employee_name}</h3>'
+    html += '<table style="width: 100%; border-collapse: collapse; background-color: white; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">'
+    html += '<thead><tr style="background-color: #2E86AB; color: white;">'
+    html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Sun</th>'
+    html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Mon</th>'
+    html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Tue</th>'
+    html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Wed</th>'
+    html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Thu</th>'
+    html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Fri</th>'
+    html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Sat</th>'
+    html += '</tr></thead><tbody>'
+    
+    # Color mapping
+    colors = {
+        'full': '#4CAF50',      # Green
+        'half': '#FFC107',      # Yellow
+        'short': '#FF9800',     # Orange
+        'absent': '#F44336',    # Red
+        'anomaly': '#9C27B0',    # Purple
+        'weekoff': '#e0e0e0'    # Grey
+    }
+    
+    status_labels = {
+        'full': 'Full Day',
+        'half': 'Half Day',
+        'short': 'Short Day',
+        'absent': 'Absent',
+        'anomaly': 'Anomaly',
+        'weekoff': 'Week Off'
+    }
+    
+    non_working_border = '#607d8b'
+    
+    for week in month_days:
+        html += "<tr>"
+        for day in week:
+            if day == 0:
+                html += '<td style="padding: 15px; border: 1px solid #ddd; background-color: #f5f5f5;"></td>'
+                continue
+
+            # Determine weekday (0=Mon, 6=Sun)
+            current_date = datetime(year, month, day)
+            weekday = current_date.weekday()
+            is_weekend = weekday >= 5
+            is_expected_workday = (weekday in expected_workdays) and not is_weekend
+
+            day_info = date_status.get(day)
+            
+            if day_info is not None:
+                status = 'absent'  # Default
+                shift_type = day_info.get('Shift Type', 'Absent')
+                if pd.isna(shift_type):
+                    shift_type = 'Absent'
+                
+                if day_info.get('Has Anomaly', False):
+                    status = 'anomaly'
+                elif shift_type == 'Full Day':
+                    status = 'full'
+                elif shift_type == 'Half Day':
+                    status = 'half'
+                elif shift_type == 'Short Shift':
+                    status = 'short'
+                elif day_info.get('Working Hours', 0) > 0:
+                    status = 'short'
+                
+                worked_on_non_working = not is_expected_workday
+                hours = day_info.get('Working Hours', 0.0)
+                bg_color = colors.get(status, '#ffffff')
+                label = status_labels.get(status, '')
+                
+                # Tooltip info
+                info = f"Status: {shift_type} | Hours: {hours:.1f}h"
+                if worked_on_non_working:
+                    info = f"Worked on Non-Working Day | {info}"
+                if pd.notna(day_info.get('First Punch In')):
+                    info += f" | In: {day_info['First Punch In'].strftime('%H:%M')}"
+                if pd.notna(day_info.get('Last Punch Out')):
+                    info += f" | Out: {day_info['Last Punch Out'].strftime('%H:%M')}"
+                if day_info.get('Is Late', False):
+                    info += " | Late"
+                if day_info.get('Is Very Late', False):
+                    info += " (Very Late)"
+                
+                is_early_departure = day_info.get('Is Early Departure', False)
+                if early_departure_override and pd.notna(day_info.get('Last Punch Out')):
+                    is_early_departure = day_info['Last Punch Out'].time() < early_departure_override
+                if is_early_departure:
+                    info += " | Early Departure"
+                    if early_departure_override:
+                        info += f" ({early_departure_override.strftime('%H:%M')})"
+                
+                info_escaped = info.replace('"', '&quot;')
+                cell_style = (
+                    f"padding: 10px; text-align: center; border: 1px solid #ddd; "
+                    f"background-color: {bg_color}; color: white; font-weight: bold; min-width: 100px;"
+                )
+                if worked_on_non_working:
+                    cell_style += f" box-shadow: inset 0 0 0 2px {non_working_border};"
+                
+                html += f'<td style="{cell_style}" title="{info_escaped}">'
+                html += f'<div style="font-size: 16px; font-weight: bold;">{day}</div>'
+                html += f'<div style="font-size: 10px; margin-top: 3px; opacity: 0.9;">{label}</div>'
+                
+                if worked_on_non_working:
+                    html += '<div style="font-size: 9px; margin-top: 2px; opacity: 0.9;">Worked on Non-Working Day</div>'
+                
+                # In/Out times
+                if pd.notna(day_info.get('First Punch In')) or pd.notna(day_info.get('Last Punch Out')):
+                    html += '<div style="font-size: 9px; margin-top: 4px; line-height: 1.2; opacity: 0.85;">'
+                    if pd.notna(day_info.get('First Punch In')):
+                        html += f'<div>In: {day_info["First Punch In"].strftime("%H:%M")}</div>'
+                    if pd.notna(day_info.get('Last Punch Out')):
+                        html += f'<div>Out: {day_info["Last Punch Out"].strftime("%H:%M")}</div>'
+                    html += '</div>'
+                
+                html += '</td>'
+            else:
+                if is_expected_workday:
+                    # Expected workday with no punches (absent)
+                    bg_color = colors['absent']
+                    label = status_labels['absent']
+                    html += f'<td style="padding: 10px; text-align: center; border: 1px solid #ddd; background-color: {bg_color}; color: white; font-weight: bold; min-width: 100px;" title="Absent">'
+                    html += f'<div style="font-size: 16px; font-weight: bold;">{day}</div>'
+                    html += f'<div style="font-size: 10px; margin-top: 3px; opacity: 0.9;">{label}</div>'
+                    html += '</td>'
+                else:
+                    # Non-working day (week off)
+                    html += f'<td style="padding: 10px; text-align: center; border: 1px solid #ddd; background-color: {colors["weekoff"]}; color: #333; font-weight: bold; min-width: 100px;">'
+                    html += f'<div style="font-size: 16px; font-weight: bold;">{day}</div>'
+                    html += f'<div style="font-size: 10px; margin-top: 3px;">{status_labels["weekoff"]}</div>'
+                    html += '</td>'
+
+        html += "</tr>"
+    
+    html += '</tbody></table>'
+    html += '<div style="margin-top: 20px; padding: 15px; background-color: #f9f9f9; border-radius: 5px;">'
+    html += '<div style="display: flex; flex-wrap: wrap; gap: 20px; justify-content: center;">'
+    html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #4CAF50; margin-right: 8px; border: 1px solid #ddd;"></div><span>Full Day</span></div>'
+    html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #FFC107; margin-right: 8px; border: 1px solid #ddd;"></div><span>Half Day</span></div>'
     html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #FF9800; margin-right: 8px; border: 1px solid #ddd;"></div><span>Short Day</span></div>'
     html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #F44336; margin-right: 8px; border: 1px solid #ddd;"></div><span>Absent</span></div>'
     html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #9C27B0; margin-right: 8px; border: 1px solid #ddd;"></div><span>Anomaly</span></div>'
+    html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #e0e0e0; margin-right: 8px; border: 1px solid #ddd;"></div><span>Week Off</span></div>'
+    html += f'<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #ffffff; margin-right: 8px; border: 2px solid {non_working_border};"></div><span>Worked on Non-Working Day</span></div>'
     html += '</div></div></div>'
     
     return html
@@ -963,7 +1260,11 @@ def main():
     
     # Load data
     with st.spinner("🔄 Loading and processing attendance data..."):
-        raw_df, daily_df, emp_metrics_df = load_and_process_data(data_source)
+        raw_df, daily_df, emp_metrics_df, weekly_overtime_df, monthly_overtime_df = load_and_process_data(data_source)
+
+    if daily_df is None:
+        # Error is already displayed in the load function
+        st.stop()
     
     # ========================================================================
     # SIDEBAR CONTROLS
@@ -985,8 +1286,8 @@ def main():
     if len(date_range) == 2:
         start_date, end_date = date_range
         daily_filtered = daily_df[
-            (daily_df['Date'] >= start_date) &
-            (daily_df['Date'] <= end_date)
+            (daily_df['Date'].dt.date >= start_date) &
+            (daily_df['Date'].dt.date <= end_date)
         ]
     else:
         daily_filtered = daily_df
@@ -1070,15 +1371,16 @@ def main():
     # TABBED DASHBOARDS
     # ========================================================================
     
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "📊 Attendance Overview",
-        "✅ Compliance",
         "🎯 Productivity",
+        "📈 Overtime Analysis",
         "📅 Monthly Performance",
         "📊 Month-to-Month Comparison",
         "🗓️ Calendar View",
         "⚠️ Anomalies",
-        "📋 Data Table"
+        "📋 Data Table",
+        "Work Pattern Calendar"
     ])
     
     # ------------------------------------------------------------------------
@@ -1093,7 +1395,7 @@ def main():
         with col1:
             # Day of week analysis
             dow_summary = view_df.groupby('Day of Week')['Working Hours'].mean().reindex([
-                'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'
+                'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'
             ])
             
             fig = px.bar(
@@ -1127,64 +1429,15 @@ def main():
             st.caption("Breakdown of full day, half day, and short shifts")
     
     # ------------------------------------------------------------------------
-    # TAB 2: COMPLIANCE DASHBOARD
+    # TAB 2: PRODUCTIVITY DASHBOARD
     # ------------------------------------------------------------------------
     with tab2:
-        st.subheader("Compliance Dashboard")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.plotly_chart(
-                plot_compliance_trend(view_df),
-                use_container_width=True
-            )
-        
-        with col2:
-            # Shift type distribution
-            shift_dist = view_df['Shift Type'].value_counts()
-            fig = px.pie(
-                values=shift_dist.values,
-                names=shift_dist.index,
-                title='Shift Type Distribution',
-                hole=0.4
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Late arrivals by employee
-        st.subheader("Late Arrivals by Employee")
-        late_by_emp = view_df[view_df['Is Late']].groupby('Employee Full Name').size().sort_values(ascending=False).head(15)
-        
-        if len(late_by_emp) > 0:
-            fig = px.bar(
-                x=late_by_emp.values,
-                y=late_by_emp.index,
-                orientation='h',
-                title='Top 15 Employees with Most Late Arrivals',
-                labels={'x': 'Late Count', 'y': 'Employee'},
-                color=late_by_emp.values,
-                color_continuous_scale='Reds'
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No late arrivals in selected period")
-    
-    # ------------------------------------------------------------------------
-    # TAB 3: PRODUCTIVITY DASHBOARD
-    # ------------------------------------------------------------------------
-    with tab3:
         st.subheader("Productivity Dashboard")
         
-        # Always use the full employee metrics, just filter by department/employee if needed
-        emp_metrics_filtered = emp_metrics_df.copy()
-        
-        # Apply department filter if selected
-        if 'selected_dept' in locals() and selected_dept != 'All':
-            emp_metrics_filtered = emp_metrics_filtered[emp_metrics_filtered['Department'] == selected_dept]
-        
-        # Apply employee filter if selected
-        if selected_employee != 'All':
-            emp_metrics_filtered = emp_metrics_filtered[emp_metrics_filtered['Employee Full Name'] == selected_employee]
+        # Recalculate metrics based on filtered data (Date, Employee, Dept)
+        # This ensures the Productivity tab respects the Date Range filter
+        engineer = FeatureEngineer()
+        emp_metrics_filtered = engineer.calculate_productivity_metrics(daily_filtered)
         
         st.plotly_chart(
             plot_employee_ranking(emp_metrics_filtered, 'Total Hours', 10),
@@ -1208,7 +1461,66 @@ def main():
             )
         else:
             st.info("No employee data available for the selected filters.")
+
+    # ------------------------------------------------------------------------
+    # TAB 3: OVERTIME ANALYSIS
+    # ------------------------------------------------------------------------
+    with tab3:
+        st.subheader("Overtime Analysis")
+        st.markdown("**Weekly and monthly overtime hours**")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("### Weekly Overtime")
             
+            if not weekly_overtime_df.empty:
+                # Filter controls
+                years = sorted(weekly_overtime_df['Year'].unique(), reverse=True)
+                selected_year_w = st.selectbox("Select Year", years, key="ot_w_year")
+                
+                available_weeks = sorted(weekly_overtime_df[weekly_overtime_df['Year'] == selected_year_w]['Week'].unique(), reverse=True)
+                selected_week = st.selectbox("Select Week Number", available_weeks, key="ot_w_num")
+                
+                # Apply filter
+                filtered_weekly = weekly_overtime_df[
+                    (weekly_overtime_df['Year'] == selected_year_w) & 
+                    (weekly_overtime_df['Week'] == selected_week)
+                ]
+                
+                weekly_chart = plot_overtime_charts(filtered_weekly, 'weekly')
+                if weekly_chart:
+                    st.plotly_chart(weekly_chart, use_container_width=True)
+                else:
+                    st.info(f"No overtime recorded for Week {selected_week}, {selected_year_w}.")
+            else:
+                st.info("No weekly overtime data available.")
+
+        with col2:
+            st.markdown("### Monthly Overtime")
+            
+            if not monthly_overtime_df.empty:
+                # Filter controls
+                years_m = sorted(monthly_overtime_df['Year'].unique(), reverse=True)
+                selected_year_m = st.selectbox("Select Year", years_m, key="ot_m_year")
+                
+                available_months = sorted(monthly_overtime_df[monthly_overtime_df['Year'] == selected_year_m]['Month'].unique(), reverse=True)
+                selected_month = st.selectbox("Select Month", available_months, format_func=lambda x: calendar.month_name[x], key="ot_m_num")
+                
+                # Apply filter
+                filtered_monthly = monthly_overtime_df[
+                    (monthly_overtime_df['Year'] == selected_year_m) & 
+                    (monthly_overtime_df['Month'] == selected_month)
+                ]
+                
+                monthly_chart = plot_overtime_charts(filtered_monthly, 'monthly')
+                if monthly_chart:
+                    st.plotly_chart(monthly_chart, use_container_width=True)
+                else:
+                    st.info(f"No overtime recorded for {calendar.month_name[selected_month]} {selected_year_m}.")
+            else:
+                st.info("No monthly overtime data available.")
+
     # ------------------------------------------------------------------------
     # TAB 4: MONTHLY PERFORMANCE TRACKING
     # ------------------------------------------------------------------------
@@ -1683,6 +1995,52 @@ def main():
                 )
         else:
             st.warning("Please select at least one column to display")
+    
+    # ------------------------------------------------------------------------
+    # TAB 9: WORK PATTERN CALENDAR
+    # ------------------------------------------------------------------------
+    with tab9:
+        st.subheader("Work Pattern Calendar")
+        st.markdown("**Employee-specific work pattern calendar view**")
+        
+        # Employee selection
+        employee_options = sorted(daily_df['Employee Full Name'].unique().tolist())
+        selected_emp_wp = st.selectbox("Select Employee", employee_options, key="wp_cal_emp")
+        
+        # Date selection
+        available_dates = daily_df[daily_df['Employee Full Name'] == selected_emp_wp]['Date']
+        if len(available_dates) > 0:
+            min_date = available_dates.min()
+            max_date = available_dates.max()
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                selected_year_wp = st.selectbox(
+                    "Select Year",
+                    range(min_date.year, max_date.year + 1),
+                    index=len(range(min_date.year, max_date.year + 1)) - 1,
+                    key="wp_cal_year"
+                )
+            
+            with col2:
+                selected_month_wp = st.selectbox(
+                    "Select Month",
+                    range(1, 13),
+                    index=min_date.month - 1 if selected_year_wp == min_date.year else 0,
+                    key="wp_cal_month"
+                )
+            
+            # Generate calendar
+            calendar_html = create_work_pattern_calendar(daily_df, selected_emp_wp, selected_year_wp, selected_month_wp)
+            
+            # Use Streamlit's HTML component for proper rendering (not markdown)
+            components.html(calendar_html, height=700, scrolling=False)
+            
+            st.markdown("---")
+            st.info("Legend: Week Off = grey, Absent = red (expected working days only). Worked on Non-Working Day is labeled and outlined.")
+        else:
+            st.warning(f"No attendance data found for {selected_emp_wp}")
     
     # ========================================================================
     # FOOTER
