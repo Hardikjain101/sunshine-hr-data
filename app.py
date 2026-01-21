@@ -975,16 +975,10 @@ def create_attendance_calendar(daily_df: pd.DataFrame, employee_name: str, year:
     
     return html
 
-def create_work_pattern_calendar(daily_df: pd.DataFrame, employee_name: str, year: int, month: int):
+def get_employee_work_pattern(employee_name: str):
     """
-    Create a calendar view for employee attendance with employee-specific work patterns.
+    Return expected workdays and optional early departure override for an employee.
     """
-    # Filter to employee and month
-    emp_df = daily_df[daily_df['Employee Full Name'] == employee_name].copy()
-    emp_df['Date'] = pd.to_datetime(emp_df['Date'])
-    emp_df = emp_df[(emp_df['Date'].dt.year == year) & (emp_df['Date'].dt.month == month)]
-    
-    # Employee-specific work patterns (weekday: 0=Mon, 6=Sun)
     first_name = str(employee_name).strip().split()[0].title() if employee_name else ''
     default_workdays = {0, 1, 2, 3, 4}
     work_patterns = {
@@ -995,8 +989,88 @@ def create_work_pattern_calendar(daily_df: pd.DataFrame, employee_name: str, yea
         'Candice': {'workdays': {1, 2, 3}}
     }
     pattern = work_patterns.get(first_name, {'workdays': default_workdays})
-    expected_workdays = pattern['workdays']
-    early_departure_override = pattern.get('early_departure')
+    return pattern['workdays'], pattern.get('early_departure')
+
+def calculate_work_pattern_summary(daily_df: pd.DataFrame, employee_name: str, year: int, month: int) -> Dict[str, int]:
+    """
+    Summarize attendance counts using employee-specific work patterns.
+    """
+    emp_df = daily_df[daily_df['Employee Full Name'] == employee_name].copy()
+    emp_df['Date'] = pd.to_datetime(emp_df['Date'])
+    emp_df = emp_df[(emp_df['Date'].dt.year == year) & (emp_df['Date'].dt.month == month)]
+    
+    expected_workdays, _ = get_employee_work_pattern(employee_name)
+    date_status = {row['Date'].day: row for _, row in emp_df.iterrows()}
+    days_in_month = calendar.monthrange(year, month)[1]
+    
+    summary = {
+        'total_days': days_in_month,
+        'full_days': 0,
+        'half_days': 0,
+        'short_days': 0,
+        'absent_days': 0,
+        'week_off_days': 0,
+        'worked_non_working_days': 0
+    }
+    
+    for day in range(1, days_in_month + 1):
+        current_date = datetime(year, month, day)
+        weekday = current_date.weekday()
+        is_weekend = weekday >= 5
+        is_expected_workday = (weekday in expected_workdays) and not is_weekend
+        day_info = date_status.get(day)
+        
+        if day_info is not None:
+            if not is_expected_workday:
+                summary['worked_non_working_days'] += 1
+                continue
+            
+            shift_type = day_info.get('Shift Type', 'Absent')
+            if pd.isna(shift_type):
+                shift_type = 'Absent'
+            
+            if shift_type == 'Full Day':
+                summary['full_days'] += 1
+            elif shift_type == 'Half Day':
+                summary['half_days'] += 1
+            elif shift_type == 'Short Shift' or day_info.get('Working Hours', 0) > 0:
+                summary['short_days'] += 1
+            else:
+                summary['absent_days'] += 1
+        else:
+            if is_expected_workday:
+                summary['absent_days'] += 1
+            else:
+                summary['week_off_days'] += 1
+    
+    return summary
+
+def calculate_work_pattern_distribution(daily_df: pd.DataFrame, employee_name: str, year: int, month: int) -> pd.DataFrame:
+    """
+    Build a distribution DataFrame based on work pattern summary.
+    """
+    summary = calculate_work_pattern_summary(daily_df, employee_name, year, month)
+    distribution = [
+        {'Attendance Type': 'Full Day', 'Count': summary['full_days']},
+        {'Attendance Type': 'Half Day', 'Count': summary['half_days']},
+        {'Attendance Type': 'Short Day', 'Count': summary['short_days']},
+        {'Attendance Type': 'Absent', 'Count': summary['absent_days']},
+        {'Attendance Type': 'Week Off', 'Count': summary['week_off_days']},
+        {'Attendance Type': 'Worked on Non-Working Day', 'Count': summary['worked_non_working_days']}
+    ]
+    return pd.DataFrame(distribution)
+
+def create_work_pattern_calendar(daily_df: pd.DataFrame, employee_name: str, year: int, month: int):
+    """
+    Create a calendar view for employee attendance with employee-specific work patterns.
+    """
+    # Filter to employee and month
+    emp_df = daily_df[daily_df['Employee Full Name'] == employee_name].copy()
+    emp_df['Date'] = pd.to_datetime(emp_df['Date'])
+    emp_df = emp_df[(emp_df['Date'].dt.year == year) & (emp_df['Date'].dt.month == month)]
+    
+    # Employee-specific work patterns (weekday: 0=Mon, 6=Sun)
+    expected_workdays, early_departure_override = get_employee_work_pattern(employee_name)
     
     # Create calendar data structure
     cal = calendar.Calendar(firstweekday=6)  # Start with Sunday
@@ -1292,21 +1366,20 @@ def main():
     else:
         daily_filtered = daily_df
     
-    # Employee filter
-    all_employees = ['All'] + sorted(daily_df['Employee Full Name'].unique().tolist())
-    selected_employee = st.sidebar.selectbox("👤 Select Employee", all_employees)
-    
-    if selected_employee != 'All':
-        daily_filtered = daily_filtered[daily_filtered['Employee Full Name'] == selected_employee]
-    
-    # Department filter
+    # Department filter (multi-select)
     if 'Department' in daily_df.columns:
-        all_departments = ['All'] + sorted(daily_df['Department'].unique().tolist())
-        selected_dept = st.sidebar.selectbox("🏢 Select Department", all_departments)
+        dept_options = sorted(daily_filtered['Department'].dropna().unique().tolist())
+        selected_depts = st.sidebar.multiselect("dY?? Select Department", dept_options)
         
-        if selected_dept != 'All':
-            daily_filtered = daily_filtered[daily_filtered['Department'] == selected_dept]
+        if selected_depts:
+            daily_filtered = daily_filtered[daily_filtered['Department'].isin(selected_depts)]
     
+    # Employee filter (multi-select)
+    employee_options = sorted(daily_filtered['Employee Full Name'].unique().tolist())
+    selected_employees = st.sidebar.multiselect("dY` Select Employee", employee_options)
+    
+    if selected_employees:
+        daily_filtered = daily_filtered[daily_filtered['Employee Full Name'].isin(selected_employees)]
     st.sidebar.markdown("---")
     st.sidebar.subheader("🔍 View Options")
     
@@ -1371,16 +1444,16 @@ def main():
     # TABBED DASHBOARDS
     # ========================================================================
     
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "📊 Attendance Overview",
         "🎯 Productivity",
         "📈 Overtime Analysis",
         "📅 Monthly Performance",
         "📊 Month-to-Month Comparison",
-        "🗓️ Calendar View",
+        "Work Pattern Calendar",
         "⚠️ Anomalies",
         "📋 Data Table",
-        "Work Pattern Calendar"
     ])
     
     # ------------------------------------------------------------------------
@@ -1479,14 +1552,43 @@ def main():
                 years = sorted(weekly_overtime_df['Year'].unique(), reverse=True)
                 selected_year_w = st.selectbox("Select Year", years, key="ot_w_year")
                 
-                available_weeks = sorted(weekly_overtime_df[weekly_overtime_df['Year'] == selected_year_w]['Week'].unique(), reverse=True)
-                selected_week = st.selectbox("Select Week Number", available_weeks, key="ot_w_num")
+                available_months_w = sorted(
+                    daily_df[daily_df['Date'].dt.year == selected_year_w]['Date'].dt.month.unique(),
+                    reverse=True
+                )
+                
+                if not available_months_w:
+                    st.info(f"No monthly data available for {selected_year_w}.")
+                    selected_week = None
+                else:
+                    selected_month_w = st.selectbox(
+                        "Select Month",
+                        available_months_w,
+                        format_func=lambda x: calendar.month_name[x],
+                        key="ot_w_month"
+                    )
+                    
+                    weeks_in_month = sorted(
+                        daily_df[
+                            (daily_df['Date'].dt.year == selected_year_w) &
+                            (daily_df['Date'].dt.month == selected_month_w)
+                        ]['Date'].dt.isocalendar().week.unique(),
+                        reverse=True
+                    )
+                    if not weeks_in_month:
+                        st.info(f"No weeks available for {calendar.month_name[selected_month_w]} {selected_year_w}.")
+                        selected_week = None
+                    else:
+                        selected_week = st.selectbox("Select Week Number", weeks_in_month, key="ot_w_num")
                 
                 # Apply filter
-                filtered_weekly = weekly_overtime_df[
-                    (weekly_overtime_df['Year'] == selected_year_w) & 
-                    (weekly_overtime_df['Week'] == selected_week)
-                ]
+                if selected_week is None:
+                    filtered_weekly = weekly_overtime_df.iloc[0:0]
+                else:
+                    filtered_weekly = weekly_overtime_df[
+                        (weekly_overtime_df['Year'] == selected_year_w) & 
+                        (weekly_overtime_df['Week'] == selected_week)
+                    ]
                 
                 weekly_chart = plot_overtime_charts(filtered_weekly, 'weekly')
                 if weekly_chart:
@@ -1778,117 +1880,6 @@ def main():
             st.dataframe(comp_table, use_container_width=True, hide_index=True)
     
     # ------------------------------------------------------------------------
-    # TAB 6: CALENDAR VIEW
-    # ------------------------------------------------------------------------
-    with tab6:
-        st.subheader("Calendar-Based Attendance View")
-        st.markdown("**Visual calendar view of employee attendance patterns**")
-        
-        # Employee selection
-        employee_options = sorted(daily_df['Employee Full Name'].unique().tolist())
-        selected_emp_cal = st.selectbox("Select Employee", employee_options, key="cal_emp")
-        
-        # Date selection
-        available_dates = daily_df[daily_df['Employee Full Name'] == selected_emp_cal]['Date']
-        if len(available_dates) > 0:
-            min_date = available_dates.min()
-            max_date = available_dates.max()
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                selected_year = st.selectbox(
-                    "Select Year",
-                    range(min_date.year, max_date.year + 1),
-                    index=len(range(min_date.year, max_date.year + 1)) - 1,
-                    key="cal_year"
-                )
-            
-            with col2:
-                selected_month = st.selectbox(
-                    "Select Month",
-                    range(1, 13),
-                    index=min_date.month - 1 if selected_year == min_date.year else 0,
-                    key="cal_month"
-                )
-            
-            # Generate calendar
-            calendar_html = create_attendance_calendar(daily_df, selected_emp_cal, selected_year, selected_month)
-            
-            # Use Streamlit's HTML component for proper rendering (not markdown)
-            components.html(calendar_html, height=700, scrolling=False)
-            
-            st.markdown("---")
-            
-            # Add attendance distribution bar chart
-            st.markdown("### Attendance Distribution for Selected Month")
-            
-            try:
-                distribution_df = calculate_attendance_distribution(daily_df, selected_emp_cal, selected_year, selected_month)
-                
-                if len(distribution_df) > 0:
-                    # Create bar chart with appropriate colors
-                    color_map = {
-                        'Full Day': '#4CAF50',
-                        'Half Day': '#FFC107',
-                        'Short Day': '#FF9800',
-                        'Absent': '#F44336',
-                        'Anomaly': '#9C27B0'
-                    }
-                    
-                    distribution_df['Color'] = distribution_df['Attendance Type'].map(color_map)
-                    
-                    fig = px.bar(
-                        distribution_df,
-                        x='Attendance Type',
-                        y='Count',
-                        title=f'Attendance Distribution - {calendar.month_name[selected_month]} {selected_year}',
-                        labels={'Count': 'Number of Days', 'Attendance Type': 'Attendance Type'},
-                        color='Attendance Type',
-                        color_discrete_map=color_map
-                    )
-                    
-                    fig.update_layout(
-                        height=400,
-                        showlegend=False,
-                        plot_bgcolor='rgba(0,0,0,0)',
-                        paper_bgcolor='rgba(0,0,0,0)',
-                        xaxis_title='Attendance Type',
-                        yaxis_title='Number of Days'
-                    )
-                    
-                    fig.update_traces(texttemplate='%{y}', textposition='outside')
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-                    st.caption("Distribution of attendance types (Full Day, Half Day, Short Day, Absent, Anomaly) for the selected month")
-                    
-                    # Show summary statistics
-                    total_days = distribution_df['Count'].sum()
-                    col1, col2, col3, col4 = st.columns(4)
-                    
-                    with col1:
-                        st.metric("Total Working Days", total_days)
-                    
-                    with col2:
-                        full_days = distribution_df[distribution_df['Attendance Type'] == 'Full Day']['Count'].values[0] if 'Full Day' in distribution_df['Attendance Type'].values else 0
-                        st.metric("Full Days", full_days, delta=f"{(full_days/total_days*100):.1f}%" if total_days > 0 else None)
-                    
-                    with col3:
-                        half_days = distribution_df[distribution_df['Attendance Type'] == 'Half Day']['Count'].values[0] if 'Half Day' in distribution_df['Attendance Type'].values else 0
-                        st.metric("Half Days", half_days, delta=f"{(half_days/total_days*100):.1f}%" if total_days > 0 else None)
-                    
-                    with col4:
-                        absent_days = distribution_df[distribution_df['Attendance Type'] == 'Absent']['Count'].values[0] if 'Absent' in distribution_df['Attendance Type'].values else 0
-                        st.metric("Absent Days", absent_days)
-            except Exception as e:
-                st.warning(f"Could not generate attendance distribution: {str(e)}")
-            
-            st.markdown("---")
-            st.info("💡 **Legend**: Hover over any day to see detailed information including In-Time and Out-Time. Green = Full Day (≥8h), Yellow = Half Day (≥5h), Orange = Short Day, Red = Absent, Purple = Anomaly")
-        else:
-            st.warning(f"No attendance data found for {selected_emp_cal}")
-    
-    # ------------------------------------------------------------------------
     # TAB 7: ANOMALY DASHBOARD
     # ------------------------------------------------------------------------
     with tab7:
@@ -1997,50 +1988,107 @@ def main():
             st.warning("Please select at least one column to display")
     
     # ------------------------------------------------------------------------
-    # TAB 9: WORK PATTERN CALENDAR
+    # TAB 6: WORK PATTERN CALENDAR
     # ------------------------------------------------------------------------
-    with tab9:
+    with tab6:
         st.subheader("Work Pattern Calendar")
         st.markdown("**Employee-specific work pattern calendar view**")
         
-        # Employee selection
-        employee_options = sorted(daily_df['Employee Full Name'].unique().tolist())
-        selected_emp_wp = st.selectbox("Select Employee", employee_options, key="wp_cal_emp")
+        # Employee selection (respects sidebar filters)
+        wp_source_df = daily_filtered.copy()
+        employee_options = sorted(wp_source_df['Employee Full Name'].unique().tolist())
         
-        # Date selection
-        available_dates = daily_df[daily_df['Employee Full Name'] == selected_emp_wp]['Date']
-        if len(available_dates) > 0:
-            min_date = available_dates.min()
-            max_date = available_dates.max()
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                selected_year_wp = st.selectbox(
-                    "Select Year",
-                    range(min_date.year, max_date.year + 1),
-                    index=len(range(min_date.year, max_date.year + 1)) - 1,
-                    key="wp_cal_year"
-                )
-            
-            with col2:
-                selected_month_wp = st.selectbox(
-                    "Select Month",
-                    range(1, 13),
-                    index=min_date.month - 1 if selected_year_wp == min_date.year else 0,
-                    key="wp_cal_month"
-                )
-            
-            # Generate calendar
-            calendar_html = create_work_pattern_calendar(daily_df, selected_emp_wp, selected_year_wp, selected_month_wp)
-            
-            # Use Streamlit's HTML component for proper rendering (not markdown)
-            components.html(calendar_html, height=700, scrolling=False)
-            
-            st.markdown("---")
-            st.info("Legend: Week Off = grey, Absent = red (expected working days only). Worked on Non-Working Day is labeled and outlined.")
+        if len(employee_options) == 0:
+            st.warning("No employees available for the selected filters.")
         else:
-            st.warning(f"No attendance data found for {selected_emp_wp}")
+            selected_emp_wp = st.selectbox("Select Employee", employee_options, key="wp_cal_emp")
+            
+            # Date selection
+            available_dates = wp_source_df[wp_source_df['Employee Full Name'] == selected_emp_wp]['Date']
+            if len(available_dates) > 0:
+                min_date = available_dates.min()
+                max_date = available_dates.max()
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    selected_year_wp = st.selectbox(
+                        "Select Year",
+                        range(min_date.year, max_date.year + 1),
+                        index=len(range(min_date.year, max_date.year + 1)) - 1,
+                        key="wp_cal_year"
+                    )
+                
+                with col2:
+                    selected_month_wp = st.selectbox(
+                        "Select Month",
+                        range(1, 13),
+                        index=min_date.month - 1 if selected_year_wp == min_date.year else 0,
+                        key="wp_cal_month"
+                    )
+                
+                summary = calculate_work_pattern_summary(wp_source_df, selected_emp_wp, selected_year_wp, selected_month_wp)
+                
+                kpi_col1, kpi_col2, kpi_col3, kpi_col4, kpi_col5 = st.columns(5)
+                with kpi_col1:
+                    create_metric_card("Total Days", summary['total_days'])
+                with kpi_col2:
+                    create_metric_card("Full Days", summary['full_days'])
+                with kpi_col3:
+                    create_metric_card("Half Days", summary['half_days'])
+                with kpi_col4:
+                    create_metric_card("Absent Days", summary['absent_days'])
+                with kpi_col5:
+                    create_metric_card("Week Off Days", summary['week_off_days'])
+                
+                st.markdown("---")
+                
+                # Generate calendar
+                calendar_html = create_work_pattern_calendar(wp_source_df, selected_emp_wp, selected_year_wp, selected_month_wp)
+                
+                # Use Streamlit's HTML component for proper rendering (not markdown)
+                components.html(calendar_html, height=700, scrolling=False)
+                
+                st.markdown("---")
+                st.markdown("### Work Pattern Distribution")
+                
+                distribution_df = calculate_work_pattern_distribution(wp_source_df, selected_emp_wp, selected_year_wp, selected_month_wp)
+                if len(distribution_df) > 0:
+                    color_map = {
+                        'Full Day': '#4CAF50',
+                        'Half Day': '#FFC107',
+                        'Short Day': '#FF9800',
+                        'Absent': '#F44336',
+                        'Week Off': '#e0e0e0',
+                        'Worked on Non-Working Day': '#607d8b'
+                    }
+                    
+                    fig = px.bar(
+                        distribution_df,
+                        x='Attendance Type',
+                        y='Count',
+                        title=f'Distribution - {calendar.month_name[selected_month_wp]} {selected_year_wp}',
+                        labels={'Count': 'Number of Days', 'Attendance Type': 'Attendance Type'},
+                        color='Attendance Type',
+                        color_discrete_map=color_map
+                    )
+                    
+                    fig.update_layout(
+                        height=400,
+                        showlegend=False,
+                        plot_bgcolor='rgba(0,0,0,0)',
+                        paper_bgcolor='rgba(0,0,0,0)',
+                        xaxis_title='Attendance Type',
+                        yaxis_title='Number of Days'
+                    )
+                    
+                    fig.update_traces(texttemplate='%{y}', textposition='outside')
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.caption("Distribution of attendance types for the selected month (based on work patterns)")
+                
+                st.info("Legend: Week Off = grey, Absent = red (expected working days only). Worked on Non-Working Day is labeled and outlined.")
+            else:
+                st.warning(f"No attendance data found for {selected_emp_wp}")
     
     # ========================================================================
     # FOOTER
