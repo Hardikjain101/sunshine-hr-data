@@ -17,7 +17,7 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, time, timedelta
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
 import calendar
 import warnings
 import os
@@ -1060,7 +1060,129 @@ def calculate_work_pattern_distribution(daily_df: pd.DataFrame, employee_name: s
     ]
     return pd.DataFrame(distribution)
 
-def create_work_pattern_calendar(daily_df: pd.DataFrame, employee_name: str, year: int, month: int):
+def get_work_pattern_context_text(employee_name: str) -> str:
+    """
+    Build a short, human-readable message for custom work patterns.
+    """
+    expected_workdays, early_departure_override = get_employee_work_pattern(employee_name)
+    default_workdays = {0, 1, 2, 3, 4}
+    if expected_workdays == default_workdays and not early_departure_override:
+        return ""
+
+    day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    workday_names = [day_names[idx] for idx in sorted(expected_workdays)]
+
+    if len(workday_names) == 1:
+        days_text = workday_names[0]
+    elif len(workday_names) == 2:
+        days_text = f"{workday_names[0]} and {workday_names[1]}"
+    else:
+        days_text = f"{', '.join(workday_names[:-1])}, and {workday_names[-1]}"
+
+    first_name = str(employee_name).strip().split()[0].title() if employee_name else "This employee"
+    message = f"{first_name} works only on {days_text}."
+
+    if early_departure_override:
+        time_text = early_departure_override.strftime('%I:%M %p').lstrip('0')
+        message += f" Early departure threshold: {time_text}."
+
+    return message
+
+def get_expected_daily_hours(weekday: int, early_departure_override=None) -> float:
+    """
+    Return expected daily hours based on weekday rules or an override.
+    """
+    if weekday >= 5:
+        return 0.0
+
+    if early_departure_override:
+        end_time = early_departure_override
+    else:
+        end_time = Config.EARLY_DEPARTURE_TIME_FRI if weekday == 4 else Config.EARLY_DEPARTURE_TIME_MON_THU
+
+    start_time = Config.STANDARD_START_TIME
+    expected_hours = (
+        datetime.combine(datetime.today(), end_time) -
+        datetime.combine(datetime.today(), start_time)
+    ).total_seconds() / 3600
+    return max(0.0, expected_hours)
+
+def calculate_work_pattern_kpis(daily_df: pd.DataFrame, employee_name: str, year: int, month: int) -> Dict[str, float]:
+    """
+    Calculate expected vs actual and punctuality KPIs for the work pattern calendar.
+    """
+    emp_df = daily_df[daily_df['Employee Full Name'] == employee_name].copy()
+    emp_df['Date'] = pd.to_datetime(emp_df['Date'])
+    emp_df = emp_df[(emp_df['Date'].dt.year == year) & (emp_df['Date'].dt.month == month)]
+    actual_hours_all_days = emp_df['Working Hours'].sum() if not emp_df.empty else 0.0
+
+    expected_workdays, early_departure_override = get_employee_work_pattern(employee_name)
+    days_in_month = calendar.monthrange(year, month)[1]
+
+    expected_dates = []
+    expected_hours = 0.0
+    for day in range(1, days_in_month + 1):
+        current_date = datetime(year, month, day)
+        weekday = current_date.weekday()
+        is_weekend = weekday >= 5
+        is_expected = (weekday in expected_workdays) and not is_weekend
+        if is_expected:
+            expected_dates.append(current_date.date())
+            expected_hours += get_expected_daily_hours(weekday, early_departure_override)
+
+    expected_days = len(expected_dates)
+
+    if emp_df.empty:
+        expected_df = emp_df
+        non_working_df = emp_df
+    else:
+        emp_df['DateOnly'] = emp_df['Date'].dt.date
+        expected_df = emp_df[emp_df['DateOnly'].isin(expected_dates)]
+        non_working_df = emp_df[~emp_df['DateOnly'].isin(expected_dates)]
+
+    actual_days = len(expected_df)
+    actual_hours = expected_df['Working Hours'].sum() if not expected_df.empty else 0.0
+    missed_days = max(0, expected_days - actual_days)
+
+    if not expected_df.empty:
+        late_series = expected_df['Is Late'].fillna(False)
+        if early_departure_override:
+            early_series = expected_df['Last Punch Out'].apply(
+                lambda x: pd.notna(x) and x.time() < early_departure_override
+            )
+        else:
+            early_series = expected_df['Is Early Departure'].fillna(False)
+
+        early_series = early_series.fillna(False)
+        late_count = int(late_series.sum())
+        early_count = int(early_series.sum())
+        on_time_days = int((~late_series & ~early_series).sum())
+    else:
+        late_count = 0
+        early_count = 0
+        on_time_days = 0
+
+    return {
+        'expected_days': expected_days,
+        'actual_days': actual_days,
+        'missed_days': missed_days,
+        'expected_hours': expected_hours,
+        'actual_hours': actual_hours,
+        'actual_hours_all_days': actual_hours_all_days,
+        'hours_diff': actual_hours - expected_hours,
+        'late_arrivals': late_count,
+        'early_departures': early_count,
+        'on_time_days': on_time_days,
+        'worked_non_working_days': len(non_working_df)
+    }
+
+def create_work_pattern_calendar(
+    daily_df: pd.DataFrame,
+    employee_name: str,
+    year: int,
+    month: int,
+    kpi_data: Optional[Dict[str, float]] = None
+):
     """
     Create a calendar view for employee attendance with employee-specific work patterns.
     """
@@ -1080,30 +1202,194 @@ def create_work_pattern_calendar(daily_df: pd.DataFrame, employee_name: str, yea
     
     # Create date mapping
     date_status = {row['Date'].day: row for _, row in emp_df.iterrows()}
+
+    if kpi_data is None:
+        kpi_data = calculate_work_pattern_kpis(daily_df, employee_name, year, month)
+
+    expected_days = int(kpi_data.get('expected_days', 0) or 0)
+    actual_days = int(kpi_data.get('actual_days', 0) or 0)
+    missed_days = int(kpi_data.get('missed_days', 0) or 0)
+    expected_hours = float(kpi_data.get('expected_hours', 0.0) or 0.0)
+    actual_hours = float(kpi_data.get('actual_hours', 0.0) or 0.0)
+    hours_diff = float(kpi_data.get('hours_diff', 0.0) or 0.0)
+    on_time_days = int(kpi_data.get('on_time_days', 0) or 0)
+    late_arrivals = int(kpi_data.get('late_arrivals', 0) or 0)
+    early_departures = int(kpi_data.get('early_departures', 0) or 0)
+    worked_non_working_days = int(kpi_data.get('worked_non_working_days', 0) or 0)
+    anomaly_days = int(emp_df['Has Anomaly'].sum()) if 'Has Anomaly' in emp_df.columns else 0
+
+    attendance_rate = round((actual_days / expected_days) * 100) if expected_days else 0
+    punctuality_rate = round((on_time_days / expected_days) * 100) if expected_days else 0
+
+    def rate_class(value: float, good: float, warn: float) -> str:
+        if value >= good:
+            return 'good'
+        if value >= warn:
+            return 'warn'
+        return 'bad'
+
+    if expected_days == 0:
+        attendance_class = punctuality_class = hours_class = exceptions_class = 'neutral'
+        overall_class = 'neutral'
+        overall_label = 'No Expected Days'
+        overall_score_text = 'NA'
+        status_note = 'No scheduled workdays in this month.'
+    else:
+        attendance_class = rate_class(attendance_rate, 90, 75)
+        punctuality_class = rate_class(punctuality_rate, 85, 70)
+
+        abs_hours_diff = abs(hours_diff)
+        if abs_hours_diff <= 4:
+            hours_class = 'good'
+        elif abs_hours_diff <= 10:
+            hours_class = 'warn'
+        else:
+            hours_class = 'bad'
+
+        if missed_days == 0 and anomaly_days == 0 and worked_non_working_days == 0:
+            exceptions_class = 'good'
+        elif missed_days <= 2 and anomaly_days <= 1:
+            exceptions_class = 'warn'
+        else:
+            exceptions_class = 'bad'
+
+        severity = {'good': 0, 'warn': 1, 'bad': 2}
+        overall_class = max(
+            [attendance_class, punctuality_class, hours_class],
+            key=lambda cls: severity.get(cls, 1)
+        )
+        overall_label = {'good': 'On Track', 'warn': 'Needs Attention', 'bad': 'At Risk'}[overall_class]
+        overall_score_text = f"{round(attendance_rate * 0.6 + punctuality_rate * 0.4)}%"
+
+        if missed_days > 0:
+            status_note = f"{missed_days} expected day(s) missed."
+        elif late_arrivals > 0 or early_departures > 0:
+            status_note = "Timing flags present."
+        else:
+            status_note = "Attendance and timing look steady."
     
     # Build HTML calendar - Start with header
     month_name = calendar.month_name[month]
-    html = f'<div style="font-family: Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px;">'
-    html += f'<h3 style="text-align: center; color: #2E86AB; margin-bottom: 20px;">{month_name} {year} - {employee_name}</h3>'
-    html += '<table style="width: 100%; border-collapse: collapse; background-color: white; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">'
-    html += '<thead><tr style="background-color: #2E86AB; color: white;">'
-    html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Sun</th>'
-    html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Mon</th>'
-    html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Tue</th>'
-    html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Wed</th>'
-    html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Thu</th>'
-    html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Fri</th>'
-    html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Sat</th>'
+    hours_balance_text = f"{hours_diff:+.1f}h"
+    if expected_days:
+        hours_balance_note = f"{actual_hours:.1f}h actual / {expected_hours:.1f}h expected"
+    else:
+        hours_balance_note = f"{actual_hours:.1f}h logged"
+    attendance_value = f"{attendance_rate}%" if expected_days else "NA"
+    punctuality_value = f"{punctuality_rate}%" if expected_days else "NA"
+
+    html = '<div class="cal-wrap">'
+    html += """
+        <style>
+        .cal-wrap{font-family:Arial,sans-serif;max-width:980px;margin:0 auto;padding:16px;background:linear-gradient(180deg,#f5f8fb 0%,#fff 60%);border:1px solid #dde6ef;border-radius:12px;box-shadow:0 6px 18px rgba(22,43,60,.08);}
+        .cal-header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;}
+        .cal-title{font-size:20px;font-weight:700;color:#1f5f7a;}
+        .cal-subtitle{font-size:12px;color:#5d6c79;}
+        .status-summary{background:#fff;border:1px solid #dde6ef;border-radius:10px;padding:8px 10px;min-width:220px;}
+        .status-label{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#5d6c79;}
+        .status-value{font-size:20px;font-weight:700;margin-top:4px;}
+        .status-chip{display:inline-block;margin-top:6px;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;}
+        .status-chip.good{background:#e8f6ee;color:#1e5d2a;border:1px solid #bfe4c9;}
+        .status-chip.warn{background:#fff7dd;color:#7a5d00;border:1px solid #f3dd97;}
+        .status-chip.bad{background:#ffe7e7;color:#8a1f1f;border:1px solid #f1b5b5;}
+        .status-chip.neutral{background:#eef2f6;color:#4b5b66;border:1px solid #d5dde6;}
+        .status-note{font-size:12px;color:#5d6c79;margin-top:6px;}
+        .insight-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-top:12px;}
+        .insight-card{background:#fff;border:1px solid #dde6ef;border-radius:10px;padding:10px;}
+        .insight-card.good{border-left:4px solid #2f9e44;}
+        .insight-card.warn{border-left:4px solid #f2c94c;}
+        .insight-card.bad{border-left:4px solid #eb5757;}
+        .insight-card.neutral{border-left:4px solid #cbd5df;}
+        .insight-label{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#5d6c79;}
+        .insight-value{font-size:18px;font-weight:700;margin-top:4px;}
+        .insight-sub,.insight-foot{font-size:12px;color:#5d6c79;margin-top:2px;}
+        .cal-table{width:100%;border-collapse:separate;border-spacing:6px;margin-top:14px;table-layout:fixed;}
+        .cal-table th{background:#2E86AB;color:#fff;padding:8px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;border-radius:8px;}
+        .day-top{display:flex;justify-content:space-between;align-items:center;gap:6px;}
+        .day-num{font-size:14px;font-weight:700;}
+        .status-pill{display:inline-block;padding:2px 6px;border-radius:999px;font-size:9px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:#fff;}
+        .hours-pill{display:inline-block;padding:2px 6px;border-radius:6px;font-size:10px;font-weight:700;background:#fff;border:1px solid #dde6ef;}
+        .badge-row{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;}
+        .badge{font-size:9px;font-weight:700;padding:2px 5px;border-radius:4px;border:1px solid transparent;background:#fff;color:#1a1a1a;}
+        .badge-late{border-color:#eb5757;color:#8a1f1f;}
+        .badge-vlate{border-color:#b42323;background:#ffe1e1;color:#7b1515;}
+        .badge-early{border-color:#f2994a;color:#8a4a00;}
+        .badge-miss{border-color:#6c757d;color:#3f4a54;}
+        .badge-anom{border-color:#6c4ab6;color:#3d2a6d;}
+        .time-range{font-size:10px;color:#4b5b66;margin-top:4px;}
+        .hours-track{margin-top:6px;height:6px;background:#e5ebf1;border-radius:999px;overflow:hidden;}
+        .hours-fill{height:100%;display:block;background:#2f9e44;}
+        .hours-fill.warn{background:#f2c94c;}
+        .hours-fill.bad{background:#eb5757;}
+        .hours-fill.off{background:#2e86ab;}
+        .hours-fill.zero{background:#c8d0d9;}
+        .off-tag{position:absolute;top:6px;right:6px;font-size:9px;font-weight:700;padding:2px 5px;border-radius:6px;background:#fff;border:1px solid #607d8b;color:#42535e;}
+        .legend{margin-top:14px;padding:10px;background:#f7f9fb;border:1px solid #dde6ef;border-radius:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;}
+        .legend-title{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#5d6c79;margin-bottom:6px;}
+        .legend-item{display:flex;align-items:center;gap:6px;font-size:12px;color:#1f2933;margin-bottom:4px;}
+        .legend-swatch{width:14px;height:14px;border-radius:4px;border:1px solid #dde6ef;background:#fff;}
+        .legend-bar{width:24px;height:6px;border-radius:999px;background:#e5ebf1;position:relative;overflow:hidden;}
+        .legend-bar:after{content:'';position:absolute;left:0;top:0;height:100%;width:60%;background:#2f9e44;}
+        @media (max-width:900px){.cal-wrap{padding:10px}.cal-table{border-spacing:4px}.cal-title{font-size:18px}}
+        </style>
+    """
+    html += (
+        f'<div class="cal-header"><div><div class="cal-title">{month_name} {year}</div>'
+        f'<div class="cal-subtitle">{employee_name}</div></div>'
+        f'<div class="status-summary"><div class="status-label">Expectation Fit</div>'
+        f'<div class="status-value">{overall_score_text}</div>'
+        f'<div class="status-chip {overall_class}">{overall_label}</div>'
+        f'<div class="status-note">{status_note}</div></div></div>'
+    )
+    html += '<div class="insight-row">'
+    html += (
+        f'<div class="insight-card {attendance_class}"><div class="insight-label">Attendance</div>'
+        f'<div class="insight-value">{attendance_value}</div>'
+        f'<div class="insight-sub">{actual_days} of {expected_days} expected days</div>'
+        f'<div class="insight-foot">{missed_days} missed day(s)</div></div>'
+    )
+    html += (
+        f'<div class="insight-card {punctuality_class}"><div class="insight-label">Punctuality</div>'
+        f'<div class="insight-value">{punctuality_value}</div>'
+        f'<div class="insight-sub">On time {on_time_days} of {expected_days} days</div>'
+        f'<div class="insight-foot">Late {late_arrivals} | Early {early_departures}</div></div>'
+    )
+    html += (
+        f'<div class="insight-card {hours_class}"><div class="insight-label">Hours Balance</div>'
+        f'<div class="insight-value">{hours_balance_text}</div>'
+        f'<div class="insight-sub">{hours_balance_note}</div>'
+        f'<div class="insight-foot">Gap vs expectation</div></div>'
+    )
+    html += (
+        f'<div class="insight-card {exceptions_class}"><div class="insight-label">Exceptions</div>'
+        f'<div class="insight-value">{missed_days} missed</div>'
+        f'<div class="insight-sub">Off-day work {worked_non_working_days}</div>'
+        f'<div class="insight-foot">Anomaly days {anomaly_days}</div></div>'
+    )
+    html += '</div>'
+    html += '<table class="cal-table"><thead><tr>'
+    html += '<th>Sun</th><th>Mon</th><th>Tue</th><th>Wed</th><th>Thu</th><th>Fri</th><th>Sat</th>'
     html += '</tr></thead><tbody>'
     
     # Color mapping
     colors = {
-        'full': '#4CAF50',      # Green
-        'half': '#FFC107',      # Yellow
-        'short': '#FF9800',     # Orange
-        'absent': '#F44336',    # Red
-        'anomaly': '#9C27B0',    # Purple
-        'weekoff': '#e0e0e0'    # Grey
+        'full': '#e9f7ee',
+        'half': '#fff7dd',
+        'short': '#fff0e1',
+        'absent': '#ffe7e7',
+        'anomaly': '#f4eeff',
+        'weekoff': '#edf0f3'
+    }
+    pill_colors = {
+        'full': '#2f9e44',
+        'half': '#caa531',
+        'short': '#cf6d21',
+        'absent': '#b73b3b',
+        'anomaly': '#5a3fa0',
+        'weekoff': '#7a8794'
+    }
+    text_colors = {
+        'weekoff': '#4b5b66'
     }
     
     status_labels = {
@@ -1131,6 +1417,7 @@ def create_work_pattern_calendar(daily_df: pd.DataFrame, employee_name: str, yea
             is_expected_workday = (weekday in expected_workdays) and not is_weekend
 
             day_info = date_status.get(day)
+            expected_hours_day = get_expected_daily_hours(weekday, early_departure_override) if is_expected_workday else 0.0
             
             if day_info is not None:
                 status = 'absent'  # Default
@@ -1150,12 +1437,16 @@ def create_work_pattern_calendar(daily_df: pd.DataFrame, employee_name: str, yea
                     status = 'short'
                 
                 worked_on_non_working = not is_expected_workday
-                hours = day_info.get('Working Hours', 0.0)
+                hours = float(day_info.get('Working Hours', 0.0) or 0.0)
                 bg_color = colors.get(status, '#ffffff')
+                pill_color = pill_colors.get(status, '#2E86AB')
+                text_color = text_colors.get(status, '#1a1a1a')
                 label = status_labels.get(status, '')
-                
+
                 # Tooltip info
                 info = f"Status: {shift_type} | Hours: {hours:.1f}h"
+                if expected_hours_day > 0:
+                    info += f" | Expected: {expected_hours_day:.1f}h"
                 if worked_on_non_working:
                     info = f"Worked on Non-Working Day | {info}"
                 if pd.notna(day_info.get('First Punch In')):
@@ -1166,7 +1457,7 @@ def create_work_pattern_calendar(daily_df: pd.DataFrame, employee_name: str, yea
                     info += " | Late"
                 if day_info.get('Is Very Late', False):
                     info += " (Very Late)"
-                
+
                 is_early_departure = day_info.get('Is Early Departure', False)
                 if early_departure_override and pd.notna(day_info.get('Last Punch Out')):
                     is_early_departure = day_info['Last Punch Out'].time() < early_departure_override
@@ -1174,61 +1465,127 @@ def create_work_pattern_calendar(daily_df: pd.DataFrame, employee_name: str, yea
                     info += " | Early Departure"
                     if early_departure_override:
                         info += f" ({early_departure_override.strftime('%H:%M')})"
-                
+                if day_info.get('Missing Punch Out', False):
+                    info += " | Missing Punch Out"
+
                 info_escaped = info.replace('"', '&quot;')
                 cell_style = (
-                    f"padding: 10px; text-align: center; border: 1px solid #ddd; "
-                    f"background-color: {bg_color}; color: white; font-weight: bold; min-width: 100px;"
+                    f"padding: 8px; border: 1px solid #d7dee7; border-radius: 10px; "
+                    f"background-color: {bg_color}; color: {text_color}; min-height: 110px; "
+                    "vertical-align: top; position: relative;"
                 )
                 if worked_on_non_working:
                     cell_style += f" box-shadow: inset 0 0 0 2px {non_working_border};"
-                
+
+                badges = []
+                if day_info.get('Is Very Late', False):
+                    badges.append('<span class="badge badge-vlate" title="Very Late">VL</span>')
+                elif day_info.get('Is Late', False):
+                    badges.append('<span class="badge badge-late" title="Late">L</span>')
+                if is_early_departure:
+                    badges.append('<span class="badge badge-early" title="Early Departure">E</span>')
+                if day_info.get('Missing Punch Out', False):
+                    badges.append('<span class="badge badge-miss" title="Missing Punch Out">M</span>')
+                if day_info.get('Has Anomaly', False):
+                    badges.append('<span class="badge badge-anom" title="Anomaly">A</span>')
+
+                in_time = day_info['First Punch In'].strftime('%H:%M') if pd.notna(day_info.get('First Punch In')) else '--'
+                out_time = day_info['Last Punch Out'].strftime('%H:%M') if pd.notna(day_info.get('Last Punch Out')) else '--'
+                time_range = f"{in_time} - {out_time}" if in_time != '--' or out_time != '--' else ''
+
+                if expected_hours_day > 0:
+                    ratio = max(0.0, min(hours / expected_hours_day, 1.0))
+                    if ratio >= 0.95:
+                        bar_class = 'good'
+                    elif ratio >= 0.7:
+                        bar_class = 'warn'
+                    else:
+                        bar_class = 'bad'
+                else:
+                    ratio = 1.0 if hours > 0 else 0.0
+                    bar_class = 'off' if hours > 0 else 'zero'
+
                 html += f'<td style="{cell_style}" title="{info_escaped}">'
-                html += f'<div style="font-size: 16px; font-weight: bold;">{day}</div>'
-                html += f'<div style="font-size: 10px; margin-top: 3px; opacity: 0.9;">{label}</div>'
-                
+                html += '<div class="day-top">'
+                html += f'<div class="day-num">{day}</div>'
+                html += f'<span class="status-pill" style="background-color: {pill_color};">{label}</span>'
+                html += '</div>'
                 if worked_on_non_working:
-                    html += '<div style="font-size: 9px; margin-top: 2px; opacity: 0.9;">Worked on Non-Working Day</div>'
-                
-                # In/Out times
-                if pd.notna(day_info.get('First Punch In')) or pd.notna(day_info.get('Last Punch Out')):
-                    html += '<div style="font-size: 9px; margin-top: 4px; line-height: 1.2; opacity: 0.85;">'
-                    if pd.notna(day_info.get('First Punch In')):
-                        html += f'<div>In: {day_info["First Punch In"].strftime("%H:%M")}</div>'
-                    if pd.notna(day_info.get('Last Punch Out')):
-                        html += f'<div>Out: {day_info["Last Punch Out"].strftime("%H:%M")}</div>'
-                    html += '</div>'
-                
+                    html += '<div class="off-tag">OFF</div>'
+                html += '<div class="badge-row">'
+                html += f'<span class="hours-pill">{hours:.1f}h</span>'
+                if badges:
+                    html += ''.join(badges)
+                html += '</div>'
+                if time_range:
+                    html += f'<div class="time-range">{time_range}</div>'
+                if is_expected_workday or hours > 0:
+                    html += (
+                        f'<div class="hours-track"><span class="hours-fill {bar_class}" '
+                        f'style="width: {ratio * 100:.0f}%;"></span></div>'
+                    )
                 html += '</td>'
             else:
                 if is_expected_workday:
                     # Expected workday with no punches (absent)
                     bg_color = colors['absent']
-                    label = status_labels['absent']
-                    html += f'<td style="padding: 10px; text-align: center; border: 1px solid #ddd; background-color: {bg_color}; color: white; font-weight: bold; min-width: 100px;" title="Absent">'
-                    html += f'<div style="font-size: 16px; font-weight: bold;">{day}</div>'
-                    html += f'<div style="font-size: 10px; margin-top: 3px; opacity: 0.9;">{label}</div>'
+                    pill_color = pill_colors['absent']
+                    cell_style = (
+                        f"padding: 8px; border: 1px solid #d7dee7; border-radius: 10px; "
+                        f"background-color: {bg_color}; color: #1a1a1a; min-height: 110px; "
+                        "vertical-align: top; position: relative;"
+                    )
+                    html += f'<td style="{cell_style}" title="Absent">'
+                    html += '<div class="day-top">'
+                    html += f'<div class="day-num">{day}</div>'
+                    html += f'<span class="status-pill" style="background-color: {pill_color};">{status_labels["absent"]}</span>'
+                    html += '</div>'
+                    html += '<div class="badge-row">'
+                    html += '<span class="hours-pill">0.0h</span>'
+                    html += '</div>'
+                    html += '<div class="hours-track"><span class="hours-fill zero" style="width: 0%;"></span></div>'
                     html += '</td>'
                 else:
                     # Non-working day (week off)
-                    html += f'<td style="padding: 10px; text-align: center; border: 1px solid #ddd; background-color: {colors["weekoff"]}; color: #333; font-weight: bold; min-width: 100px;">'
-                    html += f'<div style="font-size: 16px; font-weight: bold;">{day}</div>'
-                    html += f'<div style="font-size: 10px; margin-top: 3px;">{status_labels["weekoff"]}</div>'
+                    bg_color = colors['weekoff']
+                    pill_color = pill_colors['weekoff']
+                    cell_style = (
+                        f"padding: 8px; border: 1px solid #d7dee7; border-radius: 10px; "
+                        f"background-color: {bg_color}; color: #4b5b66; min-height: 110px; "
+                        "vertical-align: top; position: relative;"
+                    )
+                    html += f'<td style="{cell_style}">'
+                    html += '<div class="day-top">'
+                    html += f'<div class="day-num">{day}</div>'
+                    html += f'<span class="status-pill" style="background-color: {pill_color};">{status_labels["weekoff"]}</span>'
+                    html += '</div>'
                     html += '</td>'
 
         html += "</tr>"
     
     html += '</tbody></table>'
-    html += '<div style="margin-top: 20px; padding: 15px; background-color: #f9f9f9; border-radius: 5px;">'
-    html += '<div style="display: flex; flex-wrap: wrap; gap: 20px; justify-content: center;">'
-    html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #4CAF50; margin-right: 8px; border: 1px solid #ddd;"></div><span>Full Day</span></div>'
-    html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #FFC107; margin-right: 8px; border: 1px solid #ddd;"></div><span>Half Day</span></div>'
-    html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #FF9800; margin-right: 8px; border: 1px solid #ddd;"></div><span>Short Day</span></div>'
-    html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #F44336; margin-right: 8px; border: 1px solid #ddd;"></div><span>Absent</span></div>'
-    html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #9C27B0; margin-right: 8px; border: 1px solid #ddd;"></div><span>Anomaly</span></div>'
-    html += '<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #e0e0e0; margin-right: 8px; border: 1px solid #ddd;"></div><span>Week Off</span></div>'
-    html += f'<div style="display: flex; align-items: center;"><div style="width: 30px; height: 20px; background-color: #ffffff; margin-right: 8px; border: 2px solid {non_working_border};"></div><span>Worked on Non-Working Day</span></div>'
-    html += '</div></div></div>'
+    html += '<div class="legend">'
+    html += '<div>'
+    html += '<div class="legend-title">Status</div>'
+    html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["full"]};border-color:#bfe4c9;"></span> Full Day</div>'
+    html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["half"]};border-color:#f3dd97;"></span> Half Day</div>'
+    html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["short"]};border-color:#f6caa1;"></span> Short Day</div>'
+    html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["absent"]};border-color:#f1b5b5;"></span> Absent</div>'
+    html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["anomaly"]};border-color:#cbb6f5;"></span> Anomaly</div>'
+    html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["weekoff"]};border-color:#dbe1e8;"></span> Week Off</div>'
+    html += '</div>'
+    html += '<div>'
+    html += '<div class="legend-title">Signals</div>'
+    html += '<div class="legend-item"><span class="badge badge-late">L</span> Late</div>'
+    html += '<div class="legend-item"><span class="badge badge-vlate">VL</span> Very Late</div>'
+    html += '<div class="legend-item"><span class="badge badge-early">E</span> Early Departure</div>'
+    html += '<div class="legend-item"><span class="badge badge-miss">M</span> Missing Punch Out</div>'
+    html += '<div class="legend-item"><span class="badge badge-anom">A</span> Anomaly Flag</div>'
+    html += f'<div class="legend-item"><span class="legend-swatch" style="border:2px solid {non_working_border};background:#fff;"></span> Worked on Off-Day</div>'
+    html += '<div class="legend-item"><span class="legend-bar"></span> Hours vs Expected</div>'
+    html += '</div>'
+    html += '</div>'
+    html += '</div>'
     
     return html
 
@@ -2026,28 +2383,80 @@ def main():
                         index=min_date.month - 1 if selected_year_wp == min_date.year else 0,
                         key="wp_cal_month"
                     )
-                
-                summary = calculate_work_pattern_summary(wp_source_df, selected_emp_wp, selected_year_wp, selected_month_wp)
-                
-                kpi_col1, kpi_col2, kpi_col3, kpi_col4, kpi_col5 = st.columns(5)
-                with kpi_col1:
-                    create_metric_card("Total Days", summary['total_days'])
-                with kpi_col2:
-                    create_metric_card("Full Days", summary['full_days'])
-                with kpi_col3:
-                    create_metric_card("Half Days", summary['half_days'])
-                with kpi_col4:
-                    create_metric_card("Absent Days", summary['absent_days'])
-                with kpi_col5:
-                    create_metric_card("Week Off Days", summary['week_off_days'])
-                
+
+                pattern_message = get_work_pattern_context_text(selected_emp_wp)
+                if pattern_message:
+                    st.markdown(
+                        f"""
+                        <div style="background-color: #f3f6fb; border-left: 4px solid #2E86AB;
+                                    padding: 10px 14px; border-radius: 6px; color: #1a1a1a;">
+                            {pattern_message}
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+
+                kpi_data = calculate_work_pattern_kpis(wp_source_df, selected_emp_wp, selected_year_wp, selected_month_wp)
+                st.markdown("### Calendar KPIs")
+                kpi_row1 = st.columns(3)
+                with kpi_row1[0]:
+                    create_metric_card("Expected Working Days", int(kpi_data['expected_days']))
+                with kpi_row1[1]:
+                    create_metric_card(
+                        "Actual Worked Days",
+                        int(kpi_data['actual_days']),
+                        help_text="Counts attendance on expected workdays only."
+                    )
+                with kpi_row1[2]:
+                    create_metric_card("Days Missed", int(kpi_data['missed_days']))
+
+                kpi_row2 = st.columns(3)
+                with kpi_row2[0]:
+                    create_metric_card("Expected Working Hours", f"{kpi_data['expected_hours']:.1f}h")
+                with kpi_row2[1]:
+                    create_metric_card(
+                        "Actual Worked Hours",
+                        f"{kpi_data['actual_hours']:.1f}h",
+                        help_text="Totals expected workdays only."
+                    )
+                with kpi_row2[2]:
+                    create_metric_card("Hours Short / Extra", f"{kpi_data['hours_diff']:+.1f}h")
+
+                kpi_row_extra = st.columns(3)
+                with kpi_row_extra[0]:
+                    create_metric_card(
+                        "Total Actual Hours (All Days)",
+                        f"{kpi_data['actual_hours_all_days']:.1f}h",
+                        help_text="Includes expected and non-working days."
+                    )
+
+                kpi_row3 = st.columns(3)
+                with kpi_row3[0]:
+                    create_metric_card("Late Arrivals", int(kpi_data['late_arrivals']))
+                with kpi_row3[1]:
+                    create_metric_card("Early Departures", int(kpi_data['early_departures']))
+                with kpi_row3[2]:
+                    create_metric_card("On-Time Days", int(kpi_data['on_time_days']))
+
+                if kpi_data['worked_non_working_days'] > 0:
+                    st.caption(
+                        f"Worked on non-working days: {int(kpi_data['worked_non_working_days'])} "
+                        "day(s) highlighted in the calendar."
+                    )
+
                 st.markdown("---")
                 
                 # Generate calendar
-                calendar_html = create_work_pattern_calendar(wp_source_df, selected_emp_wp, selected_year_wp, selected_month_wp)
+                calendar_html = create_work_pattern_calendar(
+                    wp_source_df,
+                    selected_emp_wp,
+                    selected_year_wp,
+                    selected_month_wp,
+                    kpi_data
+                )
                 
                 # Use Streamlit's HTML component for proper rendering (not markdown)
-                components.html(calendar_html, height=700, scrolling=False)
+                components.html(calendar_html, height=900, scrolling=False)
                 
                 st.markdown("---")
                 st.markdown("### Work Pattern Distribution")
@@ -2055,11 +2464,11 @@ def main():
                 distribution_df = calculate_work_pattern_distribution(wp_source_df, selected_emp_wp, selected_year_wp, selected_month_wp)
                 if len(distribution_df) > 0:
                     color_map = {
-                        'Full Day': '#4CAF50',
-                        'Half Day': '#FFC107',
-                        'Short Day': '#FF9800',
-                        'Absent': '#F44336',
-                        'Week Off': '#e0e0e0',
+                        'Full Day': '#2f9e44',
+                        'Half Day': '#caa531',
+                        'Short Day': '#cf6d21',
+                        'Absent': '#b73b3b',
+                        'Week Off': '#7a8794',
                         'Worked on Non-Working Day': '#607d8b'
                     }
                     
@@ -2086,7 +2495,7 @@ def main():
                     st.plotly_chart(fig, use_container_width=True)
                     st.caption("Distribution of attendance types for the selected month (based on work patterns)")
                 
-                st.info("Legend: Week Off = grey, Absent = red (expected working days only). Worked on Non-Working Day is labeled and outlined.")
+                st.info("Legend is embedded in the calendar. OFF tags mark off-day work; L/E/M/A badges highlight timing and punch issues.")
             else:
                 st.warning(f"No attendance data found for {selected_emp_wp}")
     
