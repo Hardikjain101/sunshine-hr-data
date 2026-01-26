@@ -1316,6 +1316,7 @@ def create_work_pattern_calendar(
         .badge-early{border-color:#f2994a;color:#8a4a00;}
         .badge-miss{border-color:#6c757d;color:#3f4a54;}
         .badge-anom{border-color:#6c4ab6;color:#3d2a6d;}
+        .ot-pill{font-size:9px;font-weight:700;padding:2px 6px;border-radius:6px;background:#edf0f3;border:1px dashed #c7d1dc;color:#2f3a43;}
         .time-range{font-size:10px;color:#4b5b66;margin-top:4px;}
         .hours-track{margin-top:6px;height:6px;background:#e5ebf1;border-radius:999px;overflow:hidden;}
         .hours-fill{height:100%;display:block;background:#2f9e44;}
@@ -1438,6 +1439,10 @@ def create_work_pattern_calendar(
                 
                 worked_on_non_working = not is_expected_workday
                 hours = float(day_info.get('Working Hours', 0.0) or 0.0)
+                if weekday == 4:
+                    daily_overtime = max(0.0, hours - 4.25)
+                else:
+                    daily_overtime = max(0.0, hours - 8.5)
                 bg_color = colors.get(status, '#ffffff')
                 pill_color = pill_colors.get(status, '#2E86AB')
                 text_color = text_colors.get(status, '#1a1a1a')
@@ -1514,6 +1519,8 @@ def create_work_pattern_calendar(
                     html += '<div class="off-tag">OFF</div>'
                 html += '<div class="badge-row">'
                 html += f'<span class="hours-pill">{hours:.1f}h</span>'
+                if daily_overtime > 0:
+                    html += f'<span class="ot-pill">OT: +{daily_overtime:.1f}h</span>'
                 if badges:
                     html += ''.join(badges)
                 html += '</div>'
