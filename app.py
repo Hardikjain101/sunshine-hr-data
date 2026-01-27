@@ -562,6 +562,18 @@ def plot_overtime_charts(overtime_df: pd.DataFrame, time_period: str, top_n: int
 
 class DataManager:
     """Handles data persistence and file management"""
+
+    @staticmethod
+    def _get_excel_extension(name_or_path: str) -> str:
+        return os.path.splitext(str(name_or_path or ""))[1].lower()
+
+    @staticmethod
+    def _get_excel_engine(ext: str) -> Optional[str]:
+        if ext == ".xlsx":
+            return "openpyxl"
+        if ext == ".xls":
+            return "xlrd"
+        return None
     
     @staticmethod
     def merge_and_save(uploaded_file, target_path: str):
@@ -570,14 +582,30 @@ class DataManager:
         """
         try:
             # Load new data
-            new_df = pd.read_excel(uploaded_file)
+            uploaded_file.seek(0)
+            upload_ext = DataManager._get_excel_extension(getattr(uploaded_file, "name", ""))
+            if upload_ext not in [".xlsx", ".xls"]:
+                st.error("Unsupported file type. Please upload a .xlsx or .xls file.")
+                return False
+            upload_engine = DataManager._get_excel_engine(upload_ext)
+            try:
+                new_df = pd.read_excel(uploaded_file, engine=upload_engine)
+            except Exception:
+                uploaded_file.seek(0)
+                try:
+                    new_df = pd.read_excel(uploaded_file)
+                except Exception:
+                    st.error("Error reading the uploaded Excel file. Please verify it is a valid .xlsx or .xls.")
+                    return False
             
             # Check if target file exists
             if os.path.exists(target_path):
                 try:
-                    existing_df = pd.read_excel(target_path)
+                    target_ext = DataManager._get_excel_extension(target_path)
+                    target_engine = DataManager._get_excel_engine(target_ext)
+                    existing_df = pd.read_excel(target_path, engine=target_engine)
                     # Combine datasets
-                    combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                    combined_df = pd.concat([existing_df, new_df], ignore_index=True, sort=False)
                     # Remove exact duplicates
                     combined_df = combined_df.drop_duplicates()
                 except Exception:
@@ -586,10 +614,23 @@ class DataManager:
                 combined_df = new_df
             
             # Save merged data
-            combined_df.to_excel(target_path, index=False)
+            base_path, target_ext = os.path.splitext(target_path)
+            if target_ext.lower() not in [".xlsx", ".xls"]:
+                st.error("Data file path must be .xlsx or .xls.")
+                return False
+            temp_path = f"{base_path}.tmp{target_ext}"
+            target_engine = DataManager._get_excel_engine(target_ext.lower())
+            with pd.ExcelWriter(temp_path, engine=target_engine) as writer:
+                combined_df.to_excel(writer, index=False)
+            os.replace(temp_path, target_path)
             return True
             
         except Exception as e:
+            try:
+                if 'temp_path' in locals() and os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
             st.error(f"Error saving data: {str(e)}")
             return False
 
@@ -637,6 +678,68 @@ def load_and_process_data(uploaded_file) -> Tuple[pd.DataFrame, pd.DataFrame, pd
     except Exception as e:
         st.error(f"Error loading data: {str(e)}")
         return None, None, None, None, None
+
+# ============================================================================
+# CACHED AGGREGATIONS (PERFORMANCE)
+# ============================================================================
+
+@st.cache_data(show_spinner=False)
+def get_productivity_metrics(daily_df: pd.DataFrame) -> pd.DataFrame:
+    return FeatureEngineer.calculate_productivity_metrics(daily_df)
+
+@st.cache_data(show_spinner=False)
+def get_dow_summary(view_df: pd.DataFrame) -> pd.Series:
+    return view_df.groupby('Day of Week')['Working Hours'].mean().reindex([
+        'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'
+    ])
+
+@st.cache_data(show_spinner=False)
+def get_monthly_metrics_cached(daily_df: pd.DataFrame) -> pd.DataFrame:
+    return calculate_monthly_metrics(daily_df)
+
+@st.cache_data(show_spinner=False)
+def get_recent_changes(monthly_df: pd.DataFrame) -> pd.DataFrame:
+    monthly_df_sorted = monthly_df.sort_values(['Employee Full Name', 'YearMonth'])
+    monthly_df_sorted['Prev Total Hours'] = monthly_df_sorted.groupby('Employee Full Name')['Total Hours'].shift(1)
+    monthly_df_sorted['Hours Change'] = monthly_df_sorted['Total Hours'] - monthly_df_sorted['Prev Total Hours']
+    monthly_df_sorted['Hours Change %'] = (monthly_df_sorted['Hours Change'] / monthly_df_sorted['Prev Total Hours'] * 100).round(1)
+    available_months = sorted(monthly_df_sorted['YearMonth'].unique().tolist())
+    if not available_months:
+        return monthly_df_sorted.iloc[0:0]
+    recent_changes = monthly_df_sorted[monthly_df_sorted['YearMonth'] == available_months[-1]].copy()
+    recent_changes = recent_changes[recent_changes['Prev Total Hours'].notna()].sort_values('Hours Change', ascending=False)
+    return recent_changes
+
+@st.cache_data(show_spinner=False)
+def get_work_pattern_kpis_cached(
+    daily_df: pd.DataFrame, employee_name: str, year: int, month: int
+) -> Dict[str, float]:
+    return calculate_work_pattern_kpis(daily_df, employee_name, year, month)
+
+@st.cache_data(show_spinner=False)
+def get_work_pattern_distribution_cached(
+    daily_df: pd.DataFrame, employee_name: str, year: int, month: int
+) -> pd.DataFrame:
+    return calculate_work_pattern_distribution(daily_df, employee_name, year, month)
+
+@st.cache_data(show_spinner=False)
+def get_work_pattern_calendar_cached(
+    daily_df: pd.DataFrame,
+    employee_name: str,
+    year: int,
+    month: int,
+    kpi_data: Optional[Dict[str, float]] = None
+) -> str:
+    return create_work_pattern_calendar(daily_df, employee_name, year, month, kpi_data)
+
+@st.cache_data(show_spinner=False)
+def count_working_days(start_date, end_date) -> int:
+    if start_date is None or end_date is None:
+        return 0
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+    date_index = pd.date_range(start=start_date, end=end_date, freq="D")
+    return int((date_index.weekday < 5).sum())
 
 # ============================================================================
 # VISUALIZATION FUNCTIONS
@@ -875,11 +978,11 @@ def create_attendance_calendar(daily_df: pd.DataFrame, employee_name: str, year:
     }
     
     status_labels = {
-        'full': '✓ Full Day',
-        'half': '½ Half Day',
-        'short': '! Short',
-        'absent': '✗ Absent',
-        'anomaly': '⚠ Anomaly',
+        'full': 'Full Day',
+        'half': 'Half Day',
+        'short': 'Short Day',
+        'absent': 'Absent',
+        'anomaly': 'Anomaly',
         'weekoff': 'Week Off'
     }
     
@@ -1604,7 +1707,7 @@ def main():
     # Page configuration
     st.set_page_config(
         page_title="HR Attendance Analytics",
-        page_icon="📊",
+        page_icon="HR",
         layout="wide",
         initial_sidebar_state="expanded"
     )
@@ -1670,34 +1773,37 @@ def main():
     """, unsafe_allow_html=True)
         
     # Header
-    st.title("📊 HR Attendance Analytics Dashboard")
+    st.title("\U0001F4CA HR Attendance Analytics Dashboard")
     st.markdown("**Complete workforce attendance insights for data-driven HR decisions**")
     st.markdown("---")
     
     # FILE MANAGEMENT & PERSISTENCE
     st.sidebar.markdown("---")
-    st.sidebar.subheader("📁 Data Management")
+    st.sidebar.subheader("\U0001F4CA Data Management")
     uploaded_file = st.sidebar.file_uploader("Update Data Source", type=['xlsx', 'xls'])
     
     data_source = None
     
     # 1. Handle new file upload (Append/Refresh)
     if uploaded_file is not None:
-        with st.spinner("🔄 Merging and updating data..."):
-            DataManager.merge_and_save(uploaded_file, Config.DATA_FILE_PATH)
-        st.sidebar.success("✅ Data updated successfully!")
-        st.cache_data.clear()
-        data_source = Config.DATA_FILE_PATH
+        with st.spinner("Merging and updating data..."):
+            merge_ok = DataManager.merge_and_save(uploaded_file, Config.DATA_FILE_PATH)
+        if merge_ok:
+            st.sidebar.success("\u2705 Data updated successfully!")
+            st.cache_data.clear()
+            data_source = Config.DATA_FILE_PATH
+        else:
+            st.stop()
     # 2. Check for existing persistent file
     elif os.path.exists(Config.DATA_FILE_PATH):
         data_source = Config.DATA_FILE_PATH
     
     if data_source is None:
-        st.info("👋 Welcome! Please upload an Excel file in the sidebar to initialize the dashboard.")
+        st.info("Welcome! Please upload an Excel file in the sidebar to initialize the dashboard.")
         st.stop()
     
     # Load data
-    with st.spinner("🔄 Loading and processing attendance data..."):
+    with st.spinner("Loading and processing attendance data..."):
         raw_df, daily_df, emp_metrics_df, weekly_overtime_df, monthly_overtime_df = load_and_process_data(data_source)
 
     if daily_df is None:
@@ -1708,14 +1814,14 @@ def main():
     # SIDEBAR CONTROLS
     # ========================================================================
     
-    st.sidebar.header("🎛️ Filters & Controls")
+    st.sidebar.header("\U0001F3AF Filters & Controls")
     
     # Date range filter
     min_date = daily_df['Date'].min()
     max_date = daily_df['Date'].max()
     
     date_range = st.sidebar.date_input(
-        "📅 Select Date Range",
+        "Select Date Range",
         value=(min_date, max_date),
         min_value=min_date,
         max_value=max_date
@@ -1729,29 +1835,30 @@ def main():
         ]
     else:
         daily_filtered = daily_df
+        start_date, end_date = min_date.date(), max_date.date()
     
     # Department filter (multi-select)
     if 'Department' in daily_df.columns:
         dept_options = sorted(daily_filtered['Department'].dropna().unique().tolist())
-        selected_depts = st.sidebar.multiselect("dY?? Select Department", dept_options)
+        selected_depts = st.sidebar.multiselect("Select Department", dept_options)
         
         if selected_depts:
             daily_filtered = daily_filtered[daily_filtered['Department'].isin(selected_depts)]
     
     # Employee filter (multi-select)
     employee_options = sorted(daily_filtered['Employee Full Name'].unique().tolist())
-    selected_employees = st.sidebar.multiselect("dY` Select Employee", employee_options)
+    selected_employees = st.sidebar.multiselect("Select Employee", employee_options)
     
     if selected_employees:
         daily_filtered = daily_filtered[daily_filtered['Employee Full Name'].isin(selected_employees)]
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🔍 View Options")
+    st.sidebar.subheader("\U0001F4CA View Options")
     
     # Toggle options
-    exclude_duplicates = st.sidebar.checkbox("✅ Exclude Duplicate Punches", value=True)
-    show_anomalies_only = st.sidebar.checkbox("⚠️ Show Anomalies Only", value=False)
-    show_late_only = st.sidebar.checkbox("🕐 Late Arrivals Only", value=False)
-    show_early_only = st.sidebar.checkbox("🕔 Early Departures Only", value=False)
+    exclude_duplicates = st.sidebar.checkbox("Exclude Duplicate Punches", value=True)
+    show_anomalies_only = st.sidebar.checkbox("Show Anomalies Only", value=False)
+    show_late_only = st.sidebar.checkbox("Late Arrivals Only", value=False)
+    show_early_only = st.sidebar.checkbox("Early Departures Only", value=False)
     
     # Apply filters
     view_df = daily_filtered.copy()
@@ -1766,7 +1873,7 @@ def main():
         view_df = view_df[view_df['Is Early Departure']]
     # Debug info
     st.sidebar.markdown("---")
-    st.sidebar.subheader("📊 Filter Debug")
+    st.sidebar.subheader("\U0001F4CA Filter Debug")
     st.sidebar.write(f"Records after filters: {len(view_df)}")
     st.sidebar.write(f"Date range in data: {daily_df['Date'].min()} to {daily_df['Date'].max()}")
     
@@ -1774,33 +1881,33 @@ def main():
     # KPI SUMMARY CARDS
     # ========================================================================
     
-    st.header("📈 Key Performance Indicators")
+    st.header("\U0001F4CA Key Performance Indicators")
     
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     
     with col1:
         total_employees = view_df['Employee Number'].nunique()
-        create_metric_card("👥 Total Employees", total_employees)
+        create_metric_card("\U0001F4CA Total Employees", total_employees)
     
     with col2:
-        total_days = view_df['Date'].nunique()
-        create_metric_card("📅 Working Days", total_days)
+        total_days = count_working_days(start_date, end_date)
+        create_metric_card("\U0001F5D3 Working Days", total_days)
     
     with col3:
         avg_hours = view_df['Working Hours'].mean()
-        create_metric_card("⏱️ Avg Daily Hours", f"{avg_hours:.2f}h")
+        create_metric_card("\u23F1 Avg Daily Hours", f"{avg_hours:.2f}h")
     
     with col4:
         late_pct = (view_df['Is Late'].sum() / len(view_df) * 100) if len(view_df) > 0 else 0
-        create_metric_card("🕐 Late Arrivals", f"{late_pct:.1f}%")
+        create_metric_card("\u26A0 Late Arrivals", f"{late_pct:.1f}%")
     
     with col5:
         early_pct = (view_df['Is Early Departure'].sum() / len(view_df) * 100) if len(view_df) > 0 else 0
-        create_metric_card("🕔 Early Departures", f"{early_pct:.1f}%")
+        create_metric_card("\u26A0 Early Departures", f"{early_pct:.1f}%")
     
     with col6:
         anomaly_count = view_df['Has Anomaly'].sum()
-        create_metric_card("⚠️ Anomalies", anomaly_count)
+        create_metric_card("\u26A0 Anomalies", anomaly_count)
     
     st.markdown("---")
     
@@ -1809,73 +1916,41 @@ def main():
     # ========================================================================
     
     
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-        "📊 Attendance Overview",
-        "🎯 Productivity",
-        "📈 Overtime Analysis",
-        "📅 Monthly Performance",
-        "📊 Month-to-Month Comparison",
-        "Work Pattern Calendar",
-        "⚠️ Anomalies",
-        "📋 Data Table",
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "\U0001F3AF Productivity",
+        "\U0001F4C8 Overtime Analysis",
+        "\U0001F4C8 Monthly Performance",
+        "\U0001F4CA Month-to-Month Comparison",
+        "\U0001F5D3 Work Pattern Calendar",
+        "\u26A0 Anomalies",
+        "\U0001F4CA Data Table",
     ])
-    
     # ------------------------------------------------------------------------
-    # TAB 1: ATTENDANCE OVERVIEW
+    # TAB 1: PRODUCTIVITY DASHBOARD
     # ------------------------------------------------------------------------
     with tab1:
-        st.subheader("Attendance Overview")
-        st.markdown("**Daily attendance patterns and trends**")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Day of week analysis
-            dow_summary = view_df.groupby('Day of Week')['Working Hours'].mean().reindex([
-                'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'
-            ])
-            
-            fig = px.bar(
-                x=dow_summary.index,
-                y=dow_summary.values,
-                title='Average Working Hours by Day of Week',
-                labels={'x': 'Day', 'y': 'Avg Hours'},
-                color=dow_summary.values,
-                color_continuous_scale='Blues'
-            )
-            fig.update_layout(
-                plot_bgcolor='rgba(0,0,0,0)',
-                paper_bgcolor='rgba(0,0,0,0)',
-                height=400
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption("Shows average working hours across different days of the week")
-        
-        with col2:
-            # Shift type distribution
-            shift_dist = view_df['Shift Type'].value_counts()
-            fig = px.pie(
-                values=shift_dist.values,
-                names=shift_dist.index,
-                title='Shift Type Distribution',
-                hole=0.4,
-                color_discrete_sequence=px.colors.qualitative.Set2
-            )
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption("Breakdown of full day, half day, and short shifts")
-    
-    # ------------------------------------------------------------------------
-    # TAB 2: PRODUCTIVITY DASHBOARD
-    # ------------------------------------------------------------------------
-    with tab2:
-        st.subheader("Productivity Dashboard")
+        st.subheader("\U0001F3AF Productivity Dashboard")
         
         # Recalculate metrics based on filtered data (Date, Employee, Dept)
         # This ensures the Productivity tab respects the Date Range filter
-        engineer = FeatureEngineer()
-        emp_metrics_filtered = engineer.calculate_productivity_metrics(daily_filtered)
-        
+        emp_metrics_filtered = get_productivity_metrics(daily_filtered)
+        # Day of week analysis
+        dow_summary = get_dow_summary(view_df)
+        fig = px.bar(
+            x=dow_summary.index,
+            y=dow_summary.values,
+            title='Average Working Hours by Day of Week',
+            labels={'x': 'Day', 'y': 'Avg Hours'},
+            color=dow_summary.values,
+            color_continuous_scale='Blues'
+        )
+        fig.update_layout(
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
+            height=400
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Shows average working hours across different days of the week")        
         st.plotly_chart(
             plot_employee_ranking(emp_metrics_filtered, 'Total Hours', 10),
             use_container_width=True
@@ -1900,10 +1975,10 @@ def main():
             st.info("No employee data available for the selected filters.")
 
     # ------------------------------------------------------------------------
-    # TAB 3: OVERTIME ANALYSIS
+    # TAB 2: OVERTIME ANALYSIS
     # ------------------------------------------------------------------------
-    with tab3:
-        st.subheader("Overtime Analysis")
+    with tab2:
+        st.subheader("\U0001F4C8 Overtime Analysis")
         st.markdown("**Weekly and monthly overtime hours**")
 
         col1, col2 = st.columns(2)
@@ -1987,15 +2062,47 @@ def main():
             else:
                 st.info("No monthly overtime data available.")
 
+        st.markdown("---")
+        st.markdown("### Employee Monthly Overtime Trend")
+        if not monthly_overtime_df.empty:
+            employee_ot_options = sorted(monthly_overtime_df['Employee Full Name'].unique().tolist())
+            selected_emp_ot = st.selectbox("Select Employee", employee_ot_options, key="ot_emp_monthly")
+            emp_monthly_ot = monthly_overtime_df[
+                monthly_overtime_df['Employee Full Name'] == selected_emp_ot
+            ].copy()
+            if emp_monthly_ot.empty:
+                st.info(f"No monthly overtime data available for {selected_emp_ot}.")
+            else:
+                emp_monthly_ot['Month Start'] = pd.to_datetime(
+                    dict(year=emp_monthly_ot['Year'], month=emp_monthly_ot['Month'], day=1)
+                )
+                emp_monthly_ot = emp_monthly_ot.sort_values('Month Start')
+                fig = px.line(
+                    emp_monthly_ot,
+                    x='Month Start',
+                    y='Monthly Overtime',
+                    markers=True,
+                    title=f"Monthly Overtime Trend: {selected_emp_ot}",
+                    labels={'Month Start': 'Month', 'Monthly Overtime': 'Overtime Hours'}
+                )
+                fig.update_layout(
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    height=400
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption("Month-by-month overtime hours for the selected employee")
+        else:
+            st.info("No monthly overtime data available for trend analysis.")
     # ------------------------------------------------------------------------
-    # TAB 4: MONTHLY PERFORMANCE TRACKING
+    # TAB 3: MONTHLY PERFORMANCE TRACKING
     # ------------------------------------------------------------------------
-    with tab4:
-        st.subheader("Monthly Performance Tracking")
+    with tab3:
+        st.subheader("\U0001F4C8 Monthly Performance Tracking")
         st.markdown("**Long-term performance trends and month-over-month analytics**")
         
         # Calculate monthly metrics
-        monthly_df = calculate_monthly_metrics(daily_df)
+        monthly_df = get_monthly_metrics_cached(daily_df)
         
         if len(monthly_df) == 0:
             st.info("No monthly data available for the selected filters.")
@@ -2049,14 +2156,7 @@ def main():
             st.markdown("### Month-over-Month Change Indicators")
             
             # Calculate MoM changes
-            monthly_df_sorted = monthly_df.sort_values(['Employee Full Name', 'YearMonth'])
-            monthly_df_sorted['Prev Total Hours'] = monthly_df_sorted.groupby('Employee Full Name')['Total Hours'].shift(1)
-            monthly_df_sorted['Hours Change'] = monthly_df_sorted['Total Hours'] - monthly_df_sorted['Prev Total Hours']
-            monthly_df_sorted['Hours Change %'] = (monthly_df_sorted['Hours Change'] / monthly_df_sorted['Prev Total Hours'] * 100).round(1)
-            
-            # Show recent changes (last available month vs previous)
-            recent_changes = monthly_df_sorted[monthly_df_sorted['YearMonth'] == available_months[-1]].copy()
-            recent_changes = recent_changes[recent_changes['Prev Total Hours'].notna()].sort_values('Hours Change', ascending=False)
+            recent_changes = get_recent_changes(monthly_df)
             
             if len(recent_changes) > 0:
                 st.dataframe(
@@ -2081,10 +2181,10 @@ def main():
             )
     
     # ------------------------------------------------------------------------
-    # TAB 5: MONTH-TO-MONTH COMPARISON
+    # TAB 4: MONTH-TO-MONTH COMPARISON
     # ------------------------------------------------------------------------
-    with tab5:
-        st.subheader("Employee Month-to-Month Comparison")
+    with tab4:
+        st.subheader("\U0001F4CA Employee Month-to-Month Comparison")
         st.markdown("**Compare employee performance across two different months**")
         
         # Employee selection
@@ -2093,13 +2193,13 @@ def main():
         
         # Calculate monthly metrics if not already done
         if 'monthly_df' not in locals():
-            monthly_df = calculate_monthly_metrics(daily_df)
+            monthly_df = get_monthly_metrics_cached(daily_df)
         
         # Get available months for this employee
         emp_months = sorted(monthly_df[monthly_df['Employee Full Name'] == selected_emp_comp]['YearMonth'].unique().tolist())
         
         if len(emp_months) < 2:
-            st.warning(f"⚠️ Insufficient data for {selected_emp_comp}. Need at least 2 months of data for comparison.")
+            st.warning(f"Insufficient data for {selected_emp_comp}. Need at least 2 months of data for comparison.")
         else:
             col1, col2 = st.columns(2)
             
@@ -2244,10 +2344,10 @@ def main():
             st.dataframe(comp_table, use_container_width=True, hide_index=True)
     
     # ------------------------------------------------------------------------
-    # TAB 7: ANOMALY DASHBOARD
+    # TAB 6: ANOMALY DASHBOARD
     # ------------------------------------------------------------------------
-    with tab7:
-        st.subheader("Anomaly Detection & Analysis")
+    with tab6:
+        st.subheader("\u26A0 Anomaly Detection & Analysis")
         
         # Anomaly summary
         col1, col2, col3, col4 = st.columns(4)
@@ -2262,7 +2362,7 @@ def main():
         
         with col3:
             long_shifts = view_df['Unusually Long'].sum()
-            st.metric("Long Shifts (>12h)", long_shifts)
+            st.metric("Long Shifts (>10h)", long_shifts)
         
         with col4:
             odd_punches = view_df['Odd Punch Count'].sum()
@@ -2279,13 +2379,13 @@ def main():
         if len(anomaly_records) > 0:
             st.dataframe(anomaly_records, use_container_width=True, height=400)
         else:
-            st.success("✅ No anomalies detected in selected period!")
+            st.success("No anomalies detected in selected period!")
     
     # ------------------------------------------------------------------------
-    # TAB 8: DATA TABLE & EXPORT
+    # TAB 7: DATA TABLE & EXPORT
     # ------------------------------------------------------------------------
-    with tab8:
-        st.subheader("Attendance Data Table")
+    with tab7:
+        st.subheader("\U0001F4CA Attendance Data Table")
         
         # Column selector
         available_cols = view_df.columns.tolist()
@@ -2305,14 +2405,14 @@ def main():
             st.dataframe(display_data, use_container_width=True, height=500)
             
             # Export options
-            st.subheader("📥 Export Data")
+            st.subheader("\U0001F4CA Export Data")
             
             col1, col2, col3 = st.columns(3)
             
             with col1:
                 csv_daily = view_df.to_csv(index=False).encode('utf-8')
                 st.download_button(
-                    label="📄 Download Daily Records (CSV)",
+                    label="Download Daily Records (CSV)",
                     data=csv_daily,
                     file_name=f"daily_attendance_{datetime.now().strftime('%Y%m%d')}.csv",
                     mime="text/csv"
@@ -2325,7 +2425,7 @@ def main():
                 csv_emp = emp_export.to_csv(index=False).encode('utf-8')
                 
                 st.download_button(
-                    label="📊 Download Employee Summary (CSV)",
+                    label="Download Employee Summary (CSV)",
                     data=csv_emp,
                     file_name=f"employee_summary_{datetime.now().strftime('%Y%m%d')}.csv",
                     mime="text/csv"
@@ -2343,7 +2443,7 @@ def main():
                 
                 csv_monthly = monthly.to_csv(index=False).encode('utf-8')
                 st.download_button(
-                    label="📅 Download Monthly Summary (CSV)",
+                    label="Download Monthly Summary (CSV)",
                     data=csv_monthly,
                     file_name=f"monthly_summary_{datetime.now().strftime('%Y%m%d')}.csv",
                     mime="text/csv"
@@ -2352,10 +2452,10 @@ def main():
             st.warning("Please select at least one column to display")
     
     # ------------------------------------------------------------------------
-    # TAB 6: WORK PATTERN CALENDAR
+    # TAB 5: WORK PATTERN CALENDAR
     # ------------------------------------------------------------------------
-    with tab6:
-        st.subheader("Work Pattern Calendar")
+    with tab5:
+        st.subheader("\U0001F5D3 Work Pattern Calendar")
         st.markdown("**Employee-specific work pattern calendar view**")
         
         # Employee selection (respects sidebar filters)
@@ -2403,7 +2503,9 @@ def main():
                         unsafe_allow_html=True
                     )
 
-                kpi_data = calculate_work_pattern_kpis(wp_source_df, selected_emp_wp, selected_year_wp, selected_month_wp)
+                kpi_data = get_work_pattern_kpis_cached(
+                    wp_source_df, selected_emp_wp, selected_year_wp, selected_month_wp
+                )
                 st.markdown("### Calendar KPIs")
                 kpi_row1 = st.columns(3)
                 with kpi_row1[0]:
@@ -2454,7 +2556,7 @@ def main():
                 st.markdown("---")
                 
                 # Generate calendar
-                calendar_html = create_work_pattern_calendar(
+                calendar_html = get_work_pattern_calendar_cached(
                     wp_source_df,
                     selected_emp_wp,
                     selected_year_wp,
@@ -2468,7 +2570,9 @@ def main():
                 st.markdown("---")
                 st.markdown("### Work Pattern Distribution")
                 
-                distribution_df = calculate_work_pattern_distribution(wp_source_df, selected_emp_wp, selected_year_wp, selected_month_wp)
+                distribution_df = get_work_pattern_distribution_cached(
+                    wp_source_df, selected_emp_wp, selected_year_wp, selected_month_wp
+                )
                 if len(distribution_df) > 0:
                     color_map = {
                         'Full Day': '#2f9e44',
