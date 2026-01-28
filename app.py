@@ -1356,13 +1356,10 @@ def create_work_pattern_calendar(
         else:
             exceptions_class = 'bad'
 
-        severity = {'good': 0, 'warn': 1, 'bad': 2}
-        overall_class = max(
-            [attendance_class, punctuality_class, hours_class],
-            key=lambda cls: severity.get(cls, 1)
-        )
+        overall_score = attendance_rate * 0.6 + punctuality_rate * 0.4
+        overall_class = rate_class(overall_score, 85, 70)
         overall_label = {'good': 'On Track', 'warn': 'Needs Attention', 'bad': 'At Risk'}[overall_class]
-        overall_score_text = f"{round(attendance_rate * 0.6 + punctuality_rate * 0.4)}%"
+        overall_score_text = f"{round(overall_score)}%"
 
         if missed_days > 0:
             status_note = f"{missed_days} expected day(s) missed."
@@ -1408,11 +1405,12 @@ def create_work_pattern_calendar(
         .insight-sub,.insight-foot{font-size:12px;color:#5d6c79;margin-top:2px;}
         .cal-table{width:100%;border-collapse:separate;border-spacing:6px;margin-top:14px;table-layout:fixed;}
         .cal-table th{background:#2E86AB;color:#fff;padding:8px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;border-radius:8px;}
-        .day-top{display:flex;justify-content:space-between;align-items:center;gap:6px;}
+        .cell-body{display:flex;flex-direction:column;height:100%;padding-bottom:16px;}
+        .day-top{display:flex;justify-content:space-between;align-items:center;gap:6px;min-height:18px;}
         .day-num{font-size:14px;font-weight:700;}
         .status-pill{display:inline-block;padding:2px 6px;border-radius:999px;font-size:9px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:#fff;}
         .hours-pill{display:inline-block;padding:2px 6px;border-radius:6px;font-size:10px;font-weight:700;background:#fff;border:1px solid #dde6ef;}
-        .badge-row{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;}
+        .badge-row{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;min-height:18px;}
         .badge{font-size:9px;font-weight:700;padding:2px 5px;border-radius:4px;border:1px solid transparent;background:#fff;color:#1a1a1a;}
         .badge-late{border-color:#eb5757;color:#8a1f1f;}
         .badge-vlate{border-color:#b42323;background:#ffe1e1;color:#7b1515;}
@@ -1420,8 +1418,10 @@ def create_work_pattern_calendar(
         .badge-miss{border-color:#6c757d;color:#3f4a54;}
         .badge-anom{border-color:#6c4ab6;color:#3d2a6d;}
         .ot-pill{font-size:9px;font-weight:700;padding:2px 6px;border-radius:6px;background:#edf0f3;border:1px dashed #c7d1dc;color:#2f3a43;}
-        .time-range{font-size:10px;color:#4b5b66;margin-top:4px;}
+        .time-range{font-size:10px;color:#4b5b66;margin-top:4px;min-height:12px;}
+        .cell-bar{position:absolute;left:8px;right:8px;bottom:8px;}
         .hours-track{margin-top:6px;height:6px;background:#e5ebf1;border-radius:999px;overflow:hidden;}
+        .hours-track.placeholder{opacity:0;}
         .hours-fill{height:100%;display:block;background:#2f9e44;}
         .hours-fill.warn{background:#f2c94c;}
         .hours-fill.bad{background:#eb5757;}
@@ -1613,7 +1613,8 @@ def create_work_pattern_calendar(
                     ratio = 1.0 if hours > 0 else 0.0
                     bar_class = 'off' if hours > 0 else 'zero'
 
-                html += f'<td style="{cell_style}" title="{info_escaped}">'
+                html += f'<td class="cal-cell" style="{cell_style}" title="{info_escaped}">'
+                html += '<div class="cell-body">'
                 html += '<div class="day-top">'
                 html += f'<div class="day-num">{day}</div>'
                 html += f'<span class="status-pill" style="background-color: {pill_color};">{label}</span>'
@@ -1627,13 +1628,17 @@ def create_work_pattern_calendar(
                 if badges:
                     html += ''.join(badges)
                 html += '</div>'
-                if time_range:
-                    html += f'<div class="time-range">{time_range}</div>'
+                html += f'<div class="time-range">{time_range or "&nbsp;"}</div>'
+                html += '<div class="cell-bar">'
                 if is_expected_workday or hours > 0:
                     html += (
                         f'<div class="hours-track"><span class="hours-fill {bar_class}" '
                         f'style="width: {ratio * 100:.0f}%;"></span></div>'
                     )
+                else:
+                    html += '<div class="hours-track placeholder"><span class="hours-fill zero" style="width: 0%;"></span></div>'
+                html += '</div>'
+                html += '</div>'
                 html += '</td>'
             else:
                 if is_expected_workday:
@@ -1645,7 +1650,8 @@ def create_work_pattern_calendar(
                         f"background-color: {bg_color}; color: #1a1a1a; min-height: 110px; "
                         "vertical-align: top; position: relative;"
                     )
-                    html += f'<td style="{cell_style}" title="Absent">'
+                    html += f'<td class="cal-cell" style="{cell_style}" title="Absent">'
+                    html += '<div class="cell-body">'
                     html += '<div class="day-top">'
                     html += f'<div class="day-num">{day}</div>'
                     html += f'<span class="status-pill" style="background-color: {pill_color};">{status_labels["absent"]}</span>'
@@ -1653,7 +1659,11 @@ def create_work_pattern_calendar(
                     html += '<div class="badge-row">'
                     html += '<span class="hours-pill">0.0h</span>'
                     html += '</div>'
+                    html += '<div class="time-range">&nbsp;</div>'
+                    html += '<div class="cell-bar">'
                     html += '<div class="hours-track"><span class="hours-fill zero" style="width: 0%;"></span></div>'
+                    html += '</div>'
+                    html += '</div>'
                     html += '</td>'
                 else:
                     # Non-working day (week off)
@@ -1664,10 +1674,17 @@ def create_work_pattern_calendar(
                         f"background-color: {bg_color}; color: #4b5b66; min-height: 110px; "
                         "vertical-align: top; position: relative;"
                     )
-                    html += f'<td style="{cell_style}">'
+                    html += f'<td class="cal-cell" style="{cell_style}">'
+                    html += '<div class="cell-body">'
                     html += '<div class="day-top">'
                     html += f'<div class="day-num">{day}</div>'
                     html += f'<span class="status-pill" style="background-color: {pill_color};">{status_labels["weekoff"]}</span>'
+                    html += '</div>'
+                    html += '<div class="badge-row"></div>'
+                    html += '<div class="time-range">&nbsp;</div>'
+                    html += '<div class="cell-bar">'
+                    html += '<div class="hours-track placeholder"><span class="hours-fill zero" style="width: 0%;"></span></div>'
+                    html += '</div>'
                     html += '</div>'
                     html += '</td>'
 
@@ -2629,3 +2646,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
