@@ -9,6 +9,7 @@ Version: 1.0
 Date: 2025
 ================================================================================
 """
+
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
@@ -21,6 +22,32 @@ import calendar
 import warnings
 import os
 warnings.filterwarnings('ignore')
+
+# ============================================================================
+# PASSWORD PROTECTION
+# ============================================================================
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "auth_error" not in st.session_state:
+    st.session_state.auth_error = False
+
+def _validate_password():
+    if st.session_state.get("password", "") == st.secrets["APP_PASSWORD"]:
+        st.session_state.authenticated = True
+        st.session_state.auth_error = False
+        st.session_state.password = ""
+        st.rerun()
+    else:
+        st.session_state.authenticated = False
+        st.session_state.auth_error = True
+        st.session_state.password = ""
+
+if not st.session_state.authenticated:
+    st.text_input("Password", type="password", key="password", on_change=_validate_password)
+    if st.session_state.auth_error:
+        st.error("Incorrect password. Please try again.")
+    st.stop()
 
 # ============================================================================
 # CONFIGURATION & CONSTANTS
