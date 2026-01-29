@@ -613,26 +613,15 @@ class DataManager:
             else:
                 combined_df = new_df
             
-            # Save merged data (atomic write)
+            # Save merged data
             base_path, target_ext = os.path.splitext(target_path)
             if target_ext.lower() not in [".xlsx", ".xls"]:
                 st.error("Data file path must be .xlsx or .xls.")
                 return False
-            target_dir = os.path.dirname(os.path.abspath(target_path)) or "."
-            os.makedirs(target_dir, exist_ok=True)
+            temp_path = f"{base_path}.tmp{target_ext}"
             target_engine = DataManager._get_excel_engine(target_ext.lower())
-            import tempfile
-            with tempfile.NamedTemporaryFile(
-                prefix=os.path.basename(base_path) + ".tmp.",
-                suffix=target_ext,
-                dir=target_dir,
-                delete=False
-            ) as tmp_file:
-                temp_path = tmp_file.name
             with pd.ExcelWriter(temp_path, engine=target_engine) as writer:
                 combined_df.to_excel(writer, index=False)
-            if not os.path.exists(temp_path):
-                raise FileNotFoundError(f"Temp file not created: {temp_path}")
             os.replace(temp_path, target_path)
             return True
             
