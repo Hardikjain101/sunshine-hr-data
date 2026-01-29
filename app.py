@@ -10,45 +10,6 @@ Date: 2025
 ================================================================================
 """
 import streamlit as st
-
-def check_password():
-    """
-    Simple password gate for Streamlit apps using st.secrets["APP_PASSWORD"].
-
-    Usage:
-      - Add this function near the top of your app.py
-      - Immediately after imports, call:
-          if not check_password():
-              st.stop()
-      - This prevents the rest of the app from rendering until the correct password is entered.
-    """
-    # Initialize session state flag
-    if "password_correct" not in st.session_state:
-        st.session_state["password_correct"] = False
-
-    # If already authenticated in this session, allow access
-    if st.session_state["password_correct"]:
-        return True
-
-    # Show password input and login button
-    pwd = st.text_input("Enter password", type="password")
-    if st.button("Login"):
-        expected = st.secrets.get("APP_PASSWORD")
-        if expected is None:
-            st.error("APP_PASSWORD is not set in Streamlit secrets.")
-            return False
-        if pwd == expected:
-            st.session_state["password_correct"] = True
-            # Optionally show a success message
-            st.success("Logged in")
-            return True
-        else:
-            st.error("Incorrect password")
-            return False
-
-    # If no login yet, stop further rendering
-    return False
-import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
