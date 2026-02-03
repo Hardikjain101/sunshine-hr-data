@@ -16,38 +16,13 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, date
 from typing import Tuple, Dict, List, Optional
 import calendar
 import warnings
 import os
+from functools import lru_cache
 warnings.filterwarnings('ignore')
-
-# ============================================================================
-# PASSWORD PROTECTION
-# ============================================================================
-
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-if "auth_error" not in st.session_state:
-    st.session_state.auth_error = False
-
-def _validate_password():
-    if st.session_state.get("password", "") == st.secrets["APP_PASSWORD"]:
-        st.session_state.authenticated = True
-        st.session_state.auth_error = False
-        st.session_state.password = ""
-        st.rerun()
-    else:
-        st.session_state.authenticated = False
-        st.session_state.auth_error = True
-        st.session_state.password = ""
-
-if not st.session_state.authenticated:
-    st.text_input("Password", type="password", key="password", on_change=_validate_password)
-    if st.session_state.auth_error:
-        st.error("Incorrect password. Please try again.")
-    st.stop()
 
 # ============================================================================
 # CONFIGURATION & CONSTANTS
@@ -71,6 +46,8 @@ class Config:
         'Brittany': 'Mid Office',
         'Dasha': 'Front Desk',
         'Mhykeisha': 'Nurse practitioner',
+        'Alexandra': 'Medical Assistants',
+        'Bethany': 'Medical Assistants',
         'Kenyelle': 'Mid Office',
         'Jasmine': 'Mid Office',
         'Courtney': 'ex employees',
@@ -115,6 +92,88 @@ class Config:
     # Consistency scoring
     EXPECTED_WORKING_DAYS = 22             # Expected days per month
 
+    # Full-name department overrides (more specific than first-name mapping)
+    FULL_NAME_DEPARTMENT_MAPPING = {
+        'Alexandra Daigle': 'Medical Assistants',
+        'Bethany Green': 'Medical Assistants'
+    }
+
+# ============================================================================
+# HOLIDAY UTILITIES
+# ============================================================================
+
+def _get_easter_date(year: int) -> date:
+    """Compute Easter Sunday date for the given year (Gregorian calendar)."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+@lru_cache(maxsize=None)
+def get_company_holidays(year: int) -> Dict[date, str]:
+    """
+    Return a mapping of holiday dates to names for the given year.
+    Holidays are based on actual calendar dates (no observed shifts).
+    """
+    easter = _get_easter_date(year)
+
+    # Fixed-date holidays
+    holidays = {
+        date(year, 1, 1): "New Year's Day",
+        date(year, 7, 4): "Independence Day",
+        date(year, 12, 24): "Christmas Eve",
+        date(year, 12, 25): "Christmas Day"
+    }
+
+    # Movable feasts based on Easter
+    holidays[easter - timedelta(days=47)] = "Mardi Gras"
+    holidays[easter - timedelta(days=2)] = "Good Friday"
+
+    # Memorial Day: last Monday in May
+    memorial = date(year, 5, 31)
+    while memorial.weekday() != 0:
+        memorial -= timedelta(days=1)
+    holidays[memorial] = "Memorial Day"
+
+    # Labor Day: first Monday in September
+    labor = date(year, 9, 1)
+    while labor.weekday() != 0:
+        labor += timedelta(days=1)
+    holidays[labor] = "Labor Day"
+
+    # Thanksgiving Day: fourth Thursday in November
+    thanksgiving = date(year, 11, 1)
+    while thanksgiving.weekday() != 3:
+        thanksgiving += timedelta(days=1)
+    thanksgiving += timedelta(weeks=3)
+    holidays[thanksgiving] = "Thanksgiving Day"
+
+    return holidays
+
+def get_holiday_map(year: int) -> Dict[date, str]:
+    """Deterministic holiday lookup for a given year (cache-safe wrapper)."""
+    return get_company_holidays(year)
+
+def get_company_holiday_set(start_date: date, end_date: date) -> set:
+    """Return a set of holiday dates across a date range (inclusive)."""
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+    holiday_set = set()
+    for year in range(start_date.year, end_date.year + 1):
+        holiday_set.update(get_company_holidays(year).keys())
+    return holiday_set
+
 # ============================================================================
 # PHASE 1: DATA CLEANING & STANDARDIZATION
 # ============================================================================
@@ -132,6 +191,11 @@ class DataCleaner:
             curr = row.get('Department')
             if pd.notna(curr) and str(curr).strip() not in ['', 'nan', 'None', 'Unknown']:
                 return curr
+            full_name = str(row.get('Employee Full Name', '')).strip().title()
+            if full_name:
+                mapped_full = Config.FULL_NAME_DEPARTMENT_MAPPING.get(full_name)
+                if mapped_full:
+                    return mapped_full
             fname = str(row.get('Employee First Name', '')).strip().title()
             return Config.DEPARTMENT_MAPPING.get(fname, 'Unknown')
             
@@ -283,34 +347,101 @@ class FeatureEngineer:
         
         # Group by employee and date
         daily_records = []
+
+        def normalize_type(series: pd.Series) -> pd.Series:
+            return series.fillna('').astype(str).str.strip().str.lower()
         
         for (emp_num, emp_name), group in valid_df.groupby(['Employee Number', 'Employee Full Name']):
             for date, date_group in group.groupby('Punch Date'):
                 date_group = date_group.sort_values('Timestamp')
-                
-                # Get first and last punch
-                first_punch = date_group['Timestamp'].min()
-                last_punch = date_group['Timestamp'].max()
-                
-                # Calculate duration
-                duration = (last_punch - first_punch).total_seconds() / 3600
-                
-                # Count punches (excluding meal breaks for work punch count)
-                punch_count = len(date_group)
-                
-                # Filter Normal punches for determining valid punch pairs
-                normal_punches = date_group[date_group['Type'] == 'Normal'] if 'Type' in date_group.columns else date_group
-                normal_punch_count = len(normal_punches)
-                
-                # Determine valid punch-in/out based on actual punch pattern
-                # Has valid punch-in: First punch exists (always true if punch_count > 0)
+                raw_punch_count = len(date_group)
+
+                # Prefer Normal punches when available, fall back to all punches if none exist
+                punch_group = date_group.copy()
+                if 'Type' in punch_group.columns:
+                    type_norm = normalize_type(punch_group['Type'])
+                    has_normal = (type_norm == 'normal').any()
+                    if has_normal:
+                        punch_group = punch_group[(type_norm == 'normal') | (type_norm == '')]
+                    if punch_group.empty:
+                        punch_group = date_group.copy()
+
+                punch_group = punch_group.dropna(subset=['Timestamp']).sort_values('Timestamp')
+
+                # Remove exact duplicates without collapsing distinct same-timestamp events
+                dedupe_cols = [
+                    'Timestamp', 'Type', 'Mode', 'Source', 'Clock', 'Door', 'Location',
+                    'Status', 'Notes', 'Additional Notes', 'User', 'IP Address'
+                ]
+                dedupe_cols = [col for col in dedupe_cols if col in punch_group.columns]
+                if len(dedupe_cols) > 1:
+                    punch_group = punch_group.drop_duplicates(subset=dedupe_cols)
+                punch_times = punch_group['Timestamp'].tolist()
+                punch_count = len(punch_times)
+
+                # Count Normal punches in the sequence (if available)
+                if 'Type' in punch_group.columns:
+                    normal_punch_count = int((normalize_type(punch_group['Type']) == 'normal').sum())
+                else:
+                    normal_punch_count = punch_count
+
+                # Compute work/break intervals from sequential pairing
+                work_seconds = 0.0
+                break_seconds = 0.0
+                valid_pairs = 0
+                invalid_pairs = 0
+                break_issues = 0
+                break_count = 0
+                first_valid_in = None
+                last_valid_out = None
+
+                for idx in range(0, punch_count - 1, 2):
+                    start = punch_times[idx]
+                    end = punch_times[idx + 1]
+                    if end > start:
+                        if first_valid_in is None:
+                            first_valid_in = start
+                        last_valid_out = end
+                        valid_pairs += 1
+                        work_seconds += (end - start).total_seconds()
+
+                        next_idx = idx + 2
+                        if next_idx < punch_count:
+                            next_in = punch_times[next_idx]
+                            if next_in > end:
+                                break_seconds += (next_in - end).total_seconds()
+                                break_count += 1
+                            else:
+                                break_issues += 1
+                    else:
+                        invalid_pairs += 1
+
+                if punch_count > 0:
+                    first_punch = punch_times[0]
+                    last_punch = punch_times[-1]
+                else:
+                    first_punch = pd.NaT
+                    last_punch = pd.NaT
+
+                work_hours = max(0.0, work_seconds / 3600)
+                meal_hours = max(0.0, break_seconds / 3600)
+
                 has_punch_in = punch_count > 0
-                
-                # Has valid punch-out: 
-                # - If multiple punches (punch_count > 1), there must be an exit (last punch is the exit)
-                # - If single punch (punch_count == 1), check if first != last (shouldn't happen but handles edge case)
-                # - In practice: multiple punches = has exit, single punch = missing exit
-                has_punch_out = punch_count > 1 or (first_punch != last_punch)
+                has_punch_out = valid_pairs > 0
+                odd_punch_count = (punch_count % 2 != 0)
+
+                first_punch_in = first_valid_in if first_valid_in is not None else first_punch
+                last_punch_out = last_valid_out if last_valid_out is not None else pd.NaT
+
+                issue_tags = []
+                if odd_punch_count:
+                    issue_tags.append("odd_punch_count")
+                if invalid_pairs > 0:
+                    issue_tags.append("invalid_work_pairs")
+                if break_issues > 0:
+                    issue_tags.append("invalid_break_gaps")
+                if has_punch_in and not has_punch_out:
+                    issue_tags.append("missing_punch_out")
                 
                 # Get additional info - handle missing values gracefully
                 if 'Department' in date_group.columns and pd.notna(date_group['Department'].iloc[0]):
@@ -329,13 +460,20 @@ class FeatureEngineer:
                     'Department': department,
                     'Supervisor': supervisor,
                     'Date': date,
-                    'First Punch In': first_punch,
-                    'Last Punch Out': last_punch,
-                    'Working Hours': round(duration, 2),
+                    'First Punch In': first_punch_in,
+                    'Last Punch Out': last_punch_out,
+                    'Working Hours': round(work_hours, 2),
+                    'Net Working Hours': round(work_hours, 2),
+                    'Meal Hours': round(meal_hours, 2),
                     'Punch Count': punch_count,
+                    'Raw Punch Count': raw_punch_count,
                     'Normal Punch Count': normal_punch_count,
                     'Has Punch In': has_punch_in,
                     'Has Punch Out': has_punch_out,
+                    'Odd Punch Count': odd_punch_count,
+                    'Break Count': break_count,
+                    'Punch Issues': '; '.join(issue_tags),
+                    'Has Punch Issues': len(issue_tags) > 0,
                     'Day of Week': first_punch.strftime('%A'),
                     'Week Number': first_punch.isocalendar()[1],
                     'Month': first_punch.strftime('%B'),
@@ -353,16 +491,31 @@ class FeatureEngineer:
         if daily_df.empty:
             return daily_df
 
+        if 'Odd Punch Count' not in daily_df.columns:
+            daily_df['Odd Punch Count'] = daily_df['Punch Count'] % 2 != 0
+
+        daily_df['Missing Punch Out'] = (
+            daily_df['Has Punch In'] &
+            (daily_df['Odd Punch Count'] | (~daily_df['Has Punch Out']))
+        )
+        daily_df['Missing Punch In'] = ~daily_df['Has Punch In']
+
         def apply_compliance_rules(row):
             # ===================
             # Late Arrival Logic
             # ===================
-            punch_in_time = row['First Punch In'].time()
-            is_late = punch_in_time > Config.LATE_GRACE_PERIOD_END
-            is_very_late = punch_in_time > Config.VERY_LATE_THRESHOLD
+            punch_in_dt = row.get('First Punch In')
+            if pd.notna(punch_in_dt):
+                punch_in_time = punch_in_dt.time()
+                is_late = punch_in_time > Config.LATE_GRACE_PERIOD_END
+                is_very_late = punch_in_time > Config.VERY_LATE_THRESHOLD
+            else:
+                punch_in_time = None
+                is_late = False
+                is_very_late = False
             
             minutes_late = 0
-            if is_late:
+            if is_late and punch_in_time is not None:
                 minutes_late = max(0, (
                     datetime.combine(datetime.today(), punch_in_time) -
                     datetime.combine(datetime.today(), Config.STANDARD_START_TIME)
@@ -372,14 +525,18 @@ class FeatureEngineer:
             # Early Departure Logic
             # =======================
             day_of_week = row['Day of Week']
-            punch_out_time = row['Last Punch Out'].time()
+            missing_out = bool(row.get('Missing Punch Out', False))
+            punch_out_dt = row.get('Last Punch Out')
+            punch_out_time = punch_out_dt.time() if pd.notna(punch_out_dt) and not missing_out else None
             
             if day_of_week == 'Friday':
                 early_departure_threshold = Config.EARLY_DEPARTURE_TIME_FRI
             else:
                 early_departure_threshold = Config.EARLY_DEPARTURE_TIME_MON_THU
 
-            is_early_departure = punch_out_time < early_departure_threshold
+            is_early_departure = False
+            if punch_out_time is not None:
+                is_early_departure = punch_out_time < early_departure_threshold
             
             minutes_early = 0
             if is_early_departure:
@@ -393,7 +550,7 @@ class FeatureEngineer:
             # ========================
             working_hours = row['Working Hours']
             shift_type = 'Short Shift' # Default
-            if day_of_week == 'Friday':
+            if day_of_week == 'Friday' and punch_out_time is not None:
                 # Friday is a full day if they punch out after the designated time
                 if punch_out_time >= Config.FRIDAY_FULL_DAY_PUNCH_OUT:
                     shift_type = 'Full Day'
@@ -418,16 +575,6 @@ class FeatureEngineer:
             'Is Early Departure', 'Minutes Early',
             'Shift Type'
         ]] = daily_df.apply(apply_compliance_rules, axis=1)
-
-        # ========================
-        # Missing Punch Logic
-        # ========================
-        daily_df['Missing Punch Out'] = (
-            (daily_df['First Punch In'] == daily_df['Last Punch Out']) &
-            (daily_df['Punch Count'] == 1)
-        )
-        daily_df['Missing Punch In'] = ~daily_df['Has Punch In']
-        daily_df['Odd Punch Count'] = daily_df['Punch Count'] % 2 != 0
         
         return daily_df
     
@@ -538,6 +685,7 @@ class FeatureEngineer:
         weekly_df['Year'] = weekly_df['Date'].dt.year
         
         weekly_hours = weekly_df.groupby(['Employee Full Name', 'Year', 'Week'])['Working Hours'].sum().reset_index()
+        weekly_hours['Expected Hours'] = Config.WEEKLY_STANDARD_HOURS
         weekly_hours['Weekly Overtime'] = weekly_hours['Working Hours'] - Config.WEEKLY_STANDARD_HOURS
         weekly_hours['Weekly Overtime'] = weekly_hours['Weekly Overtime'].clip(lower=0)
         
@@ -547,19 +695,93 @@ class FeatureEngineer:
         monthly_df['Year'] = monthly_df['Date'].dt.year
 
         monthly_hours = monthly_df.groupby(['Employee Full Name', 'Year', 'Month'])['Working Hours'].sum().reset_index()
+        monthly_hours['Expected Hours'] = Config.MONTHLY_STANDARD_HOURS
         monthly_hours['Monthly Overtime'] = monthly_hours['Working Hours'] - Config.MONTHLY_STANDARD_HOURS
         monthly_hours['Monthly Overtime'] = monthly_hours['Monthly Overtime'].clip(lower=0)
 
         return weekly_hours, monthly_hours
 
+def calculate_15_day_overtime(
+    daily_df: pd.DataFrame,
+    year: int,
+    month: int,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None
+) -> pd.DataFrame:
+    """
+    Calculate 15-day overtime for the first and second halves of a month.
+    Respects optional date-range limits and excludes holidays from expected hours.
+    """
+    if daily_df.empty:
+        return pd.DataFrame()
+
+    work_df = daily_df.copy()
+    work_df['Date'] = pd.to_datetime(work_df['Date'])
+    work_df = work_df[(work_df['Date'].dt.year == year) & (work_df['Date'].dt.month == month)]
+    if work_df.empty:
+        return pd.DataFrame()
+
+    if start_date and isinstance(start_date, datetime):
+        start_date = start_date.date()
+    if end_date and isinstance(end_date, datetime):
+        end_date = end_date.date()
+
+    last_day = calendar.monthrange(year, month)[1]
+    spans = [
+        ("Days 1-15", date(year, month, 1), date(year, month, 15)),
+        (f"Days 16-{last_day}", date(year, month, 16), date(year, month, last_day))
+    ]
+
+    results = []
+    for label, span_start, span_end in spans:
+        if start_date:
+            span_start = max(span_start, start_date)
+        if end_date:
+            span_end = min(span_end, end_date)
+        if span_start > span_end:
+            continue
+
+        span_df = work_df[
+            (work_df['Date'].dt.date >= span_start) &
+            (work_df['Date'].dt.date <= span_end)
+        ]
+        if span_df.empty:
+            continue
+
+        actual_hours = span_df.groupby('Employee Full Name')['Working Hours'].sum().reset_index()
+        if actual_hours.empty:
+            continue
+
+        actual_hours['Expected Hours'] = 80.0
+        actual_hours['15-Day Overtime'] = (actual_hours['Working Hours'] - 80.0).clip(lower=0)
+        actual_hours['Year'] = year
+        actual_hours['Month'] = month
+        actual_hours['Span'] = label
+        actual_hours['Span Start'] = span_start
+        actual_hours['Span End'] = span_end
+        results.append(actual_hours)
+
+    if not results:
+        return pd.DataFrame()
+    return pd.concat(results, ignore_index=True)
+
 def plot_overtime_charts(overtime_df: pd.DataFrame, time_period: str, top_n: int = 15):
     """
     Create bar chart for weekly or monthly overtime from a pre-filtered DataFrame.
     """
-    if overtime_df.empty or f'{time_period.capitalize()} Overtime' not in overtime_df.columns:
+    if overtime_df.empty:
         return None
-    
-    overtime_col = f'{time_period.capitalize()} Overtime'
+
+    period_key = str(time_period).strip().lower()
+    if period_key in ['15-day', '15 day', '15day']:
+        overtime_col = '15-Day Overtime'
+        period_label = '15-Day'
+    else:
+        period_label = time_period.capitalize()
+        overtime_col = f'{period_label} Overtime'
+
+    if overtime_col not in overtime_df.columns:
+        return None
     
     # Filter for entries with actual overtime and get the top N
     overtime_df = overtime_df[overtime_df[overtime_col] > 0]
@@ -573,7 +795,7 @@ def plot_overtime_charts(overtime_df: pd.DataFrame, time_period: str, top_n: int
         x=overtime_col,
         y='Employee Full Name',
         orientation='h',
-        title=f'Top {top_n} Employees by {time_period.capitalize()} Overtime',
+        title=f'Top {top_n} Employees by {period_label} Overtime',
         labels={overtime_col: 'Overtime Hours', 'Employee Full Name': 'Employee'},
         color=overtime_col,
         color_continuous_scale='Plasma'
@@ -765,7 +987,11 @@ def count_working_days(start_date, end_date) -> int:
     if end_date < start_date:
         start_date, end_date = end_date, start_date
     date_index = pd.date_range(start=start_date, end=end_date, freq="D")
-    return int((date_index.weekday < 5).sum())
+    holiday_set = get_company_holiday_set(start_date, end_date)
+    return int(sum(
+        (dt.weekday() < 5) and (dt.date() not in holiday_set)
+        for dt in date_index
+    ))
 
 # ============================================================================
 # VISUALIZATION FUNCTIONS
@@ -839,6 +1065,7 @@ def calculate_monthly_metrics(daily_df: pd.DataFrame) -> pd.DataFrame:
     # Calculate monthly metrics per employee
     monthly_metrics = daily_df.groupby(['Employee Number', 'Employee Full Name', 'Department', 'YearMonth']).agg({
         'Working Hours': ['sum', 'mean'],
+        'Meal Hours': 'sum',
         'Date': 'nunique',
         'Is Late': 'sum',
         'Is Early Departure': 'sum',
@@ -848,13 +1075,14 @@ def calculate_monthly_metrics(daily_df: pd.DataFrame) -> pd.DataFrame:
     # Flatten column names
     monthly_metrics.columns = [
         'Employee Number', 'Employee Full Name', 'Department', 'YearMonth',
-        'Total Hours', 'Avg Daily Hours', 'Attendance Days',
+        'Total Hours', 'Avg Daily Hours', 'Total Meal Hours', 'Attendance Days',
         'Late Count', 'Early Departure Count', 'Missing Punch Out Count'
     ]
     
     # Round numeric columns
     monthly_metrics['Total Hours'] = monthly_metrics['Total Hours'].round(2)
     monthly_metrics['Avg Daily Hours'] = monthly_metrics['Avg Daily Hours'].round(2)
+    monthly_metrics['Total Meal Hours'] = monthly_metrics['Total Meal Hours'].round(2)
     
     # Sort by YearMonth for proper chronological order
     monthly_metrics = monthly_metrics.sort_values(['Employee Full Name', 'YearMonth'])
@@ -969,14 +1197,18 @@ def create_attendance_calendar(daily_df: pd.DataFrame, employee_name: str, year:
     emp_df['Date'] = pd.to_datetime(emp_df['Date'])
     emp_df = emp_df[(emp_df['Date'].dt.year == year) & (emp_df['Date'].dt.month == month)]
     
-    # Create calendar data structure
-    cal = calendar.Calendar(firstweekday=6)  # Start with Sunday
+    # Create calendar data structure (weekdays only)
+    cal = calendar.Calendar(firstweekday=0)  # Start with Monday
     
-    # Get all days in the month
+    # Get all days in the month and keep Monday-Friday only
     month_days = cal.monthdayscalendar(year, month)
+    weekday_month_days = [week[:5] for week in month_days if any(day != 0 for day in week[:5])]
     
     # Create date mapping
     date_status = {row['Date'].day: row for _, row in emp_df.iterrows()}
+    holiday_map = get_company_holidays(year)
+    holiday_map = get_company_holidays(year)
+    holiday_map = get_company_holidays(year)
     
     # Build HTML calendar - Start with header
     month_name = calendar.month_name[month]
@@ -984,13 +1216,11 @@ def create_attendance_calendar(daily_df: pd.DataFrame, employee_name: str, year:
     html += f'<h3 style="text-align: center; color: #2E86AB; margin-bottom: 20px;">{month_name} {year} - {employee_name}</h3>'
     html += '<table style="width: 100%; border-collapse: collapse; background-color: white; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">'
     html += '<thead><tr style="background-color: #2E86AB; color: white;">'
-    html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Sun</th>'
     html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Mon</th>'
     html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Tue</th>'
     html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Wed</th>'
     html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Thu</th>'
     html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Fri</th>'
-    html += '<th style="padding: 12px; text-align: center; border: 1px solid #ddd;">Sat</th>'
     html += '</tr></thead><tbody>'
     
     # Color mapping
@@ -1000,6 +1230,7 @@ def create_attendance_calendar(daily_df: pd.DataFrame, employee_name: str, year:
         'short': '#FF9800',     # Orange
         'absent': '#F44336',    # Red
         'anomaly': '#9C27B0',    # Purple
+        'holiday': '#e0ecff',   # Light blue
         'weekoff': '#e0e0e0'    # Grey
     }
     
@@ -1009,10 +1240,11 @@ def create_attendance_calendar(daily_df: pd.DataFrame, employee_name: str, year:
         'short': 'Short Day',
         'absent': 'Absent',
         'anomaly': 'Anomaly',
+        'holiday': 'Holiday',
         'weekoff': 'Week Off'
     }
     
-    for week in month_days:
+    for week in weekday_month_days:
         html += "<tr>"
         for day in week:
             if day == 0:
@@ -1022,14 +1254,8 @@ def create_attendance_calendar(daily_df: pd.DataFrame, employee_name: str, year:
             # Determine weekday (0=Mon, 6=Sun)
             current_date = datetime(year, month, day)
             weekday = current_date.weekday()
-
-            # Handle Weekends
-            if weekday == 5 or weekday == 6: # Saturday or Sunday
-                html += f'<td style="padding: 10px; text-align: center; border: 1px solid #ddd; background-color: {colors["weekoff"]}; color: #333; font-weight: bold; min-width: 100px;">'
-                html += f'<div style="font-size: 16px; font-weight: bold;">{day}</div>'
-                html += f'<div style="font-size: 10px; margin-top: 3px;">{status_labels["weekoff"]}</div>'
-                html += '</td>'
-                continue
+            holiday_name = holiday_map.get(current_date.date())
+            is_holiday = (holiday_name is not None) and weekday < 5
 
             # Handle Weekdays
             day_info = date_status.get(day)
@@ -1049,14 +1275,21 @@ def create_attendance_calendar(daily_df: pd.DataFrame, employee_name: str, year:
                     status = 'short'
                 
                 hours = day_info['Working Hours']
+                meal_hours = float(day_info.get('Meal Hours', 0.0) or 0.0)
                 bg_color = colors.get(status, '#ffffff')
                 label = status_labels.get(status, '')
+                if is_holiday:
+                    bg_color = colors['holiday']
+                    label = status_labels['holiday']
                 
                 # Tooltip info
                 info = f"Status: {shift_type} | Hours: {hours:.1f}h"
-                if day_info.get('First Punch In'):
+                if is_holiday and holiday_name:
+                    info = f"Holiday: {holiday_name} | {info}"
+                info += f" | Meal: {meal_hours:.1f}h"
+                if pd.notna(day_info.get('First Punch In')):
                     info += f" | In: {day_info['First Punch In'].strftime('%H:%M')}"
-                if day_info.get('Last Punch Out'):
+                if pd.notna(day_info.get('Last Punch Out')):
                     info += f" | Out: {day_info['Last Punch Out'].strftime('%H:%M')}"
                 if day_info.get('Is Late', False):
                     info += " | Late"
@@ -1077,17 +1310,27 @@ def create_attendance_calendar(daily_df: pd.DataFrame, employee_name: str, year:
                         html += f'<div>In: {day_info["First Punch In"].strftime("%H:%M")}</div>'
                     if pd.notna(day_info.get('Last Punch Out')):
                         html += f'<div>Out: {day_info["Last Punch Out"].strftime("%H:%M")}</div>'
+                    html += f'<div>Meal: {meal_hours:.1f}h</div>'
                     html += '</div>'
                 
                 html += '</td>'
             else:
-                # Day with no punches (absent)
-                bg_color = colors['absent']
-                label = status_labels['absent']
-                html += f'<td style="padding: 10px; text-align: center; border: 1px solid #ddd; background-color: {bg_color}; color: white; font-weight: bold; min-width: 100px;" title="Absent">'
-                html += f'<div style="font-size: 16px; font-weight: bold;">{day}</div>'
-                html += f'<div style="font-size: 10px; margin-top: 3px; opacity: 0.9;">{label}</div>'
-                html += '</td>'
+                if is_holiday:
+                    bg_color = colors['holiday']
+                    label = status_labels['holiday']
+                    title_text = f"Holiday: {holiday_name}" if holiday_name else "Holiday"
+                    html += f'<td style="padding: 10px; text-align: center; border: 1px solid #ddd; background-color: {bg_color}; color: #1a1a1a; font-weight: bold; min-width: 100px;" title="{title_text}">'
+                    html += f'<div style="font-size: 16px; font-weight: bold;">{day}</div>'
+                    html += f'<div style="font-size: 10px; margin-top: 3px; opacity: 0.9;">{label}</div>'
+                    html += '</td>'
+                else:
+                    # Day with no punches (absent)
+                    bg_color = colors['absent']
+                    label = status_labels['absent']
+                    html += f'<td style="padding: 10px; text-align: center; border: 1px solid #ddd; background-color: {bg_color}; color: white; font-weight: bold; min-width: 100px;" title="Absent">'
+                    html += f'<div style="font-size: 16px; font-weight: bold;">{day}</div>'
+                    html += f'<div style="font-size: 10px; margin-top: 3px; opacity: 0.9;">{label}</div>'
+                    html += '</td>'
 
         html += "</tr>"
     
@@ -1129,6 +1372,7 @@ def calculate_work_pattern_summary(daily_df: pd.DataFrame, employee_name: str, y
     emp_df = emp_df[(emp_df['Date'].dt.year == year) & (emp_df['Date'].dt.month == month)]
     
     expected_workdays, _ = get_employee_work_pattern(employee_name)
+    holiday_map = get_company_holidays(year)
     date_status = {row['Date'].day: row for _, row in emp_df.iterrows()}
     days_in_month = calendar.monthrange(year, month)[1]
     
@@ -1139,6 +1383,7 @@ def calculate_work_pattern_summary(daily_df: pd.DataFrame, employee_name: str, y
         'short_days': 0,
         'absent_days': 0,
         'week_off_days': 0,
+        'holiday_days': 0,
         'worked_non_working_days': 0
     }
     
@@ -1146,8 +1391,17 @@ def calculate_work_pattern_summary(daily_df: pd.DataFrame, employee_name: str, y
         current_date = datetime(year, month, day)
         weekday = current_date.weekday()
         is_weekend = weekday >= 5
-        is_expected_workday = (weekday in expected_workdays) and not is_weekend
+        holiday_name = holiday_map.get(current_date.date())
+        is_holiday = (holiday_name is not None) and not is_weekend
+        is_expected_workday = (weekday in expected_workdays) and not is_weekend and not is_holiday
         day_info = date_status.get(day)
+
+        if is_holiday:
+            if day_info is not None:
+                summary['worked_non_working_days'] += 1
+            else:
+                summary['holiday_days'] += 1
+            continue
         
         if day_info is not None:
             if not is_expected_workday:
@@ -1184,6 +1438,7 @@ def calculate_work_pattern_distribution(daily_df: pd.DataFrame, employee_name: s
         {'Attendance Type': 'Half Day', 'Count': summary['half_days']},
         {'Attendance Type': 'Short Day', 'Count': summary['short_days']},
         {'Attendance Type': 'Absent', 'Count': summary['absent_days']},
+        {'Attendance Type': 'Holiday', 'Count': summary['holiday_days']},
         {'Attendance Type': 'Week Off', 'Count': summary['week_off_days']},
         {'Attendance Type': 'Worked on Non-Working Day', 'Count': summary['worked_non_working_days']}
     ]
@@ -1236,6 +1491,28 @@ def get_expected_daily_hours(weekday: int, early_departure_override=None) -> flo
     ).total_seconds() / 3600
     return max(0.0, expected_hours)
 
+def calculate_expected_hours_for_range(employee_name: str, start_date: date, end_date: date) -> float:
+    """
+    Calculate expected hours for an employee across a date range (inclusive),
+    excluding weekends and company holidays.
+    """
+    if start_date is None or end_date is None:
+        return 0.0
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+
+    expected_workdays, early_departure_override = get_employee_work_pattern(employee_name)
+    holiday_set = get_company_holiday_set(start_date, end_date)
+
+    total_hours = 0.0
+    current = start_date
+    while current <= end_date:
+        weekday = current.weekday()
+        if weekday < 5 and weekday in expected_workdays and current not in holiday_set:
+            total_hours += get_expected_daily_hours(weekday, early_departure_override)
+        current += timedelta(days=1)
+    return total_hours
+
 def calculate_work_pattern_kpis(daily_df: pd.DataFrame, employee_name: str, year: int, month: int) -> Dict[str, float]:
     """
     Calculate expected vs actual and punctuality KPIs for the work pattern calendar.
@@ -1247,6 +1524,7 @@ def calculate_work_pattern_kpis(daily_df: pd.DataFrame, employee_name: str, year
 
     expected_workdays, early_departure_override = get_employee_work_pattern(employee_name)
     days_in_month = calendar.monthrange(year, month)[1]
+    holiday_map = get_company_holidays(year)
 
     expected_dates = []
     expected_hours = 0.0
@@ -1254,7 +1532,9 @@ def calculate_work_pattern_kpis(daily_df: pd.DataFrame, employee_name: str, year
         current_date = datetime(year, month, day)
         weekday = current_date.weekday()
         is_weekend = weekday >= 5
-        is_expected = (weekday in expected_workdays) and not is_weekend
+        holiday_name = holiday_map.get(current_date.date())
+        is_holiday = (holiday_name is not None) and not is_weekend
+        is_expected = (weekday in expected_workdays) and not is_weekend and not is_holiday
         if is_expected:
             expected_dates.append(current_date.date())
             expected_hours += get_expected_daily_hours(weekday, early_departure_override)
@@ -1323,14 +1603,16 @@ def create_work_pattern_calendar(
     # Employee-specific work patterns (weekday: 0=Mon, 6=Sun)
     expected_workdays, early_departure_override = get_employee_work_pattern(employee_name)
     
-    # Create calendar data structure
-    cal = calendar.Calendar(firstweekday=6)  # Start with Sunday
+    # Create calendar data structure (weekdays only)
+    cal = calendar.Calendar(firstweekday=0)  # Start with Monday
     
-    # Get all days in the month
+    # Get all days in the month and keep Monday-Friday only
     month_days = cal.monthdayscalendar(year, month)
+    weekday_month_days = [week[:5] for week in month_days if any(day != 0 for day in week[:5])]
     
     # Create date mapping
     date_status = {row['Date'].day: row for _, row in emp_df.iterrows()}
+    holiday_map = get_holiday_map(year)
 
     if kpi_data is None:
         kpi_data = calculate_work_pattern_kpis(daily_df, employee_name, year, month)
@@ -1443,8 +1725,10 @@ def create_work_pattern_calendar(
         .badge-early{border-color:#f2994a;color:#8a4a00;}
         .badge-miss{border-color:#6c757d;color:#3f4a54;}
         .badge-anom{border-color:#6c4ab6;color:#3d2a6d;}
+        .badge-holiday{border-color:#2E86AB;background:#e8f1ff;color:#1f5f7a;}
         .ot-pill{font-size:9px;font-weight:700;padding:2px 6px;border-radius:6px;background:#edf0f3;border:1px dashed #c7d1dc;color:#2f3a43;}
         .time-range{font-size:10px;color:#4b5b66;margin-top:4px;min-height:12px;}
+        .meal-text{font-size:10px;color:#6b7280;margin-top:2px;min-height:12px;}
         .cell-bar{position:absolute;left:8px;right:8px;bottom:8px;}
         .hours-track{margin-top:6px;height:6px;background:#e5ebf1;border-radius:999px;overflow:hidden;}
         .hours-track.placeholder{opacity:0;}
@@ -1498,7 +1782,7 @@ def create_work_pattern_calendar(
     )
     html += '</div>'
     html += '<table class="cal-table"><thead><tr>'
-    html += '<th>Sun</th><th>Mon</th><th>Tue</th><th>Wed</th><th>Thu</th><th>Fri</th><th>Sat</th>'
+    html += '<th>Mon</th><th>Tue</th><th>Wed</th><th>Thu</th><th>Fri</th>'
     html += '</tr></thead><tbody>'
     
     # Color mapping
@@ -1508,6 +1792,7 @@ def create_work_pattern_calendar(
         'short': '#fff0e1',
         'absent': '#ffe7e7',
         'anomaly': '#f4eeff',
+        'holiday': '#e8f1ff',
         'weekoff': '#edf0f3'
     }
     pill_colors = {
@@ -1516,9 +1801,11 @@ def create_work_pattern_calendar(
         'short': '#cf6d21',
         'absent': '#b73b3b',
         'anomaly': '#5a3fa0',
+        'holiday': '#2E86AB',
         'weekoff': '#7a8794'
     }
     text_colors = {
+        'holiday': '#1f5f7a',
         'weekoff': '#4b5b66'
     }
     
@@ -1528,12 +1815,14 @@ def create_work_pattern_calendar(
         'short': 'Short Day',
         'absent': 'Absent',
         'anomaly': 'Anomaly',
+        'holiday': 'Holiday',
         'weekoff': 'Week Off'
     }
     
     non_working_border = '#607d8b'
+    holiday_border = '#2E86AB'
     
-    for week in month_days:
+    for week in weekday_month_days:
         html += "<tr>"
         for day in week:
             if day == 0:
@@ -1544,7 +1833,9 @@ def create_work_pattern_calendar(
             current_date = datetime(year, month, day)
             weekday = current_date.weekday()
             is_weekend = weekday >= 5
-            is_expected_workday = (weekday in expected_workdays) and not is_weekend
+            holiday_name = holiday_map.get(current_date.date())
+            is_holiday = (holiday_name is not None) and not is_weekend
+            is_expected_workday = (weekday in expected_workdays) and not is_weekend and not is_holiday
 
             day_info = date_status.get(day)
             expected_hours_day = get_expected_daily_hours(weekday, early_departure_override) if is_expected_workday else 0.0
@@ -1568,6 +1859,7 @@ def create_work_pattern_calendar(
                 
                 worked_on_non_working = not is_expected_workday
                 hours = float(day_info.get('Working Hours', 0.0) or 0.0)
+                meal_hours = float(day_info.get('Meal Hours', 0.0) or 0.0)
                 if weekday == 4:
                     daily_overtime = max(0.0, hours - 4.25)
                 else:
@@ -1576,9 +1868,15 @@ def create_work_pattern_calendar(
                 pill_color = pill_colors.get(status, '#2E86AB')
                 text_color = text_colors.get(status, '#1a1a1a')
                 label = status_labels.get(status, '')
+                if is_holiday:
+                    label = status_labels['holiday']
+                    pill_color = pill_colors['holiday']
 
                 # Tooltip info
                 info = f"Status: {shift_type} | Hours: {hours:.1f}h"
+                if is_holiday and holiday_name:
+                    info = f"Holiday: {holiday_name} | {info}"
+                info += f" | Meal: {meal_hours:.1f}h"
                 if expected_hours_day > 0:
                     info += f" | Expected: {expected_hours_day:.1f}h"
                 if worked_on_non_working:
@@ -1609,7 +1907,8 @@ def create_work_pattern_calendar(
                     "vertical-align: top; position: relative;"
                 )
                 if worked_on_non_working:
-                    cell_style += f" box-shadow: inset 0 0 0 2px {non_working_border};"
+                    border_color = holiday_border if is_holiday else non_working_border
+                    cell_style += f" box-shadow: inset 0 0 0 2px {border_color};"
 
                 badges = []
                 if day_info.get('Is Very Late', False):
@@ -1655,6 +1954,7 @@ def create_work_pattern_calendar(
                     html += ''.join(badges)
                 html += '</div>'
                 html += f'<div class="time-range">{time_range or "&nbsp;"}</div>'
+                html += f'<div class="meal-text">Meal: {meal_hours:.1f}h</div>'
                 html += '<div class="cell-bar">'
                 if is_expected_workday or hours > 0:
                     html += (
@@ -1667,7 +1967,32 @@ def create_work_pattern_calendar(
                 html += '</div>'
                 html += '</td>'
             else:
-                if is_expected_workday:
+                if is_holiday:
+                    # Holiday (no punches)
+                    bg_color = colors['holiday']
+                    pill_color = pill_colors['holiday']
+                    cell_style = (
+                        f"padding: 8px; border: 1px solid #d7dee7; border-radius: 10px; "
+                        f"background-color: {bg_color}; color: {text_colors.get('holiday', '#1a1a1a')}; min-height: 110px; "
+                        "vertical-align: top; position: relative;"
+                    )
+                    title_text = f'Holiday: {holiday_name}' if holiday_name else 'Holiday'
+                    html += f'<td class="cal-cell" style="{cell_style}" title="{title_text}">'
+                    html += '<div class="cell-body">'
+                    html += '<div class="day-top">'
+                    html += f'<div class="day-num">{day}</div>'
+                    html += f'<span class="status-pill" style="background-color: {pill_color};">{status_labels["holiday"]}</span>'
+                    html += '</div>'
+                    html += '<div class="badge-row">'
+                    html += '<span class="hours-pill">0.0h</span>'
+                    html += '</div>'
+                    html += '<div class="time-range">&nbsp;</div>'
+                    html += '<div class="cell-bar">'
+                    html += '<div class="hours-track placeholder"><span class="hours-fill zero" style="width: 0%;"></span></div>'
+                    html += '</div>'
+                    html += '</div>'
+                    html += '</td>'
+                elif is_expected_workday:
                     # Expected workday with no punches (absent)
                     bg_color = colors['absent']
                     pill_color = pill_colors['absent']
@@ -1724,6 +2049,7 @@ def create_work_pattern_calendar(
     html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["half"]};border-color:#f3dd97;"></span> Half Day</div>'
     html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["short"]};border-color:#f6caa1;"></span> Short Day</div>'
     html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["absent"]};border-color:#f1b5b5;"></span> Absent</div>'
+    html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["holiday"]};border-color:#c6d7f2;"></span> Holiday</div>'
     html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["anomaly"]};border-color:#cbb6f5;"></span> Anomaly</div>'
     html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["weekoff"]};border-color:#dbe1e8;"></span> Week Off</div>'
     html += '</div>'
@@ -1862,23 +2188,35 @@ def main():
     # Date range filter
     min_date = daily_df['Date'].min()
     max_date = daily_df['Date'].max()
-    
-    date_range = st.sidebar.date_input(
-        "Select Date Range",
-        value=(min_date, max_date),
-        min_value=min_date,
-        max_value=max_date
-    )
-    
-    if len(date_range) == 2:
-        start_date, end_date = date_range
+    min_date_value = min_date.date() if hasattr(min_date, "date") else min_date
+    max_date_value = max_date.date() if hasattr(max_date, "date") else max_date
+
+    date_col1, date_col2 = st.sidebar.columns(2)
+    with date_col1:
+        start_date = st.date_input(
+            "Start Date",
+            value=min_date_value,
+            min_value=min_date_value,
+            max_value=max_date_value,
+            key="start_date"
+        )
+    with date_col2:
+        end_date = st.date_input(
+            "End Date",
+            value=max_date_value,
+            min_value=start_date,
+            max_value=max_date_value,
+            key="end_date"
+        )
+
+    if start_date > end_date:
+        st.sidebar.error("Start Date must be on or before End Date.")
+        daily_filtered = daily_df.copy()
+    else:
         daily_filtered = daily_df[
             (daily_df['Date'].dt.date >= start_date) &
             (daily_df['Date'].dt.date <= end_date)
         ]
-    else:
-        daily_filtered = daily_df
-        start_date, end_date = min_date.date(), max_date.date()
     
     # Department filter (multi-select)
     if 'Department' in daily_df.columns:
@@ -2022,7 +2360,7 @@ def main():
     # ------------------------------------------------------------------------
     with tab2:
         st.subheader("\U0001F4C8 Overtime Analysis")
-        st.markdown("**Weekly and monthly overtime hours**")
+        st.markdown("**Weekly, 15-day, and monthly overtime hours**")
 
         col1, col2 = st.columns(2)
 
@@ -2106,6 +2444,54 @@ def main():
                 st.info("No monthly overtime data available.")
 
         st.markdown("---")
+        st.markdown("### 15-Day Overtime")
+        st.markdown("**First half and second half of the selected month**")
+
+        if daily_filtered.empty:
+            st.info("No data available for 15-day overtime analysis.")
+        else:
+            years_15 = sorted(daily_filtered['Date'].dt.year.unique(), reverse=True)
+            selected_year_15 = st.selectbox("Select Year", years_15, key="ot_15_year")
+
+            available_months_15 = sorted(
+                daily_filtered[daily_filtered['Date'].dt.year == selected_year_15]['Date'].dt.month.unique(),
+                reverse=True
+            )
+            if not available_months_15:
+                st.info(f"No monthly data available for {selected_year_15}.")
+            else:
+                selected_month_15 = st.selectbox(
+                    "Select Month",
+                    available_months_15,
+                    format_func=lambda x: calendar.month_name[x],
+                    key="ot_15_month"
+                )
+
+                fifteen_df = calculate_15_day_overtime(
+                    daily_filtered,
+                    selected_year_15,
+                    selected_month_15,
+                    start_date,
+                    end_date
+                )
+
+                if fifteen_df.empty:
+                    st.info(f"No 15-day overtime data available for {calendar.month_name[selected_month_15]} {selected_year_15}.")
+                else:
+                    last_day = calendar.monthrange(selected_year_15, selected_month_15)[1]
+                    span_labels = ["Days 1-15", f"Days 16-{last_day}"]
+                    col_a, col_b = st.columns(2)
+                    for col, span_label in zip([col_a, col_b], span_labels):
+                        with col:
+                            st.markdown(f"#### {span_label}")
+                            span_df = fifteen_df[fifteen_df['Span'] == span_label]
+                            span_chart = plot_overtime_charts(span_df, '15-day')
+                            if span_chart:
+                                st.plotly_chart(span_chart, use_container_width=True)
+                            else:
+                                st.info(f"No overtime recorded for {span_label}.")
+
+        st.markdown("---")
         st.markdown("### Employee Monthly Overtime Trend")
         if not monthly_overtime_df.empty:
             employee_ot_options = sorted(monthly_overtime_df['Employee Full Name'].unique().tolist())
@@ -2144,15 +2530,15 @@ def main():
         st.subheader("\U0001F4C8 Monthly Performance Tracking")
         st.markdown("**Long-term performance trends and month-over-month analytics**")
         
-        # Calculate monthly metrics
-        monthly_df = get_monthly_metrics_cached(daily_df)
+        # Calculate monthly metrics (respect sidebar filters)
+        monthly_df = get_monthly_metrics_cached(daily_filtered)
         
         if len(monthly_df) == 0:
             st.info("No monthly data available for the selected filters.")
         else:
             # Employee selection for trend view
             st.markdown("### Employee Performance Trend")
-            employee_options = sorted(daily_df['Employee Full Name'].unique().tolist())
+            employee_options = sorted(daily_filtered['Employee Full Name'].unique().tolist())
             selected_emp_trend = st.selectbox("Select Employee for Trend Analysis", employee_options, key="trend_emp")
             
             col1, col2 = st.columns(2)
@@ -2228,163 +2614,99 @@ def main():
     # ------------------------------------------------------------------------
     with tab4:
         st.subheader("\U0001F4CA Employee Month-to-Month Comparison")
-        st.markdown("**Compare employee performance across two different months**")
-        
-        # Employee selection
-        employee_options = sorted(daily_df['Employee Full Name'].unique().tolist())
-        selected_emp_comp = st.selectbox("Select Employee", employee_options, key="comp_emp")
-        
-        # Calculate monthly metrics if not already done
-        if 'monthly_df' not in locals():
-            monthly_df = get_monthly_metrics_cached(daily_df)
-        
-        # Get available months for this employee
-        emp_months = sorted(monthly_df[monthly_df['Employee Full Name'] == selected_emp_comp]['YearMonth'].unique().tolist())
-        
-        if len(emp_months) < 2:
-            st.warning(f"Insufficient data for {selected_emp_comp}. Need at least 2 months of data for comparison.")
+        st.markdown("**Compare employee performance across multiple months**")
+
+        monthly_df_comp = get_monthly_metrics_cached(daily_filtered)
+        employee_options = sorted(monthly_df_comp['Employee Full Name'].unique().tolist())
+
+        if len(employee_options) == 0:
+            st.warning("No employees available for the selected filters.")
         else:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                month1 = st.selectbox("Select First Month", emp_months, key="month1")
-            
-            with col2:
-                # Exclude month1 from month2 options
-                month2_options = [m for m in emp_months if m != month1]
-                month2 = st.selectbox("Select Second Month", month2_options, key="month2")
-            
-            # Get data for both months
-            month1_data = monthly_df[(monthly_df['Employee Full Name'] == selected_emp_comp) & 
-                                    (monthly_df['YearMonth'] == month1)].iloc[0]
-            month2_data = monthly_df[(monthly_df['Employee Full Name'] == selected_emp_comp) & 
-                                    (monthly_df['YearMonth'] == month2)].iloc[0]
-            
-            # Calculate changes
-            hours_change = month2_data['Total Hours'] - month1_data['Total Hours']
-            hours_change_pct = (hours_change / month1_data['Total Hours'] * 100) if month1_data['Total Hours'] > 0 else 0
-            
-            days_change = month2_data['Attendance Days'] - month1_data['Attendance Days']
-            late_change = month2_data['Late Count'] - month1_data['Late Count']
-            early_change = month2_data['Early Departure Count'] - month1_data['Early Departure Count']
-            
-            # Display comparison
-            st.markdown("---")
-            st.markdown(f"### Comparison: {month1} vs {month2}")
-            
-            # KPI Cards for comparison
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                delta_hours = f"{hours_change:+.1f}h ({hours_change_pct:+.1f}%)"
-                st.metric(
-                    "Total Hours",
-                    f"{month2_data['Total Hours']:.1f}h",
-                    delta=delta_hours,
-                    help=f"Month 1: {month1_data['Total Hours']:.1f}h | Month 2: {month2_data['Total Hours']:.1f}h"
-                )
-            
-            with col2:
-                st.metric(
-                    "Attendance Days",
-                    f"{month2_data['Attendance Days']} days",
-                    delta=f"{days_change:+d} days",
-                    help=f"Month 1: {month1_data['Attendance Days']} days | Month 2: {month2_data['Attendance Days']} days"
-                )
-            
-            with col3:
-                st.metric(
-                    "Late Arrivals",
-                    f"{month2_data['Late Count']}",
-                    delta=f"{late_change:+d}",
-                    help=f"Month 1: {month1_data['Late Count']} | Month 2: {month2_data['Late Count']}"
-                )
-            
-            with col4:
-                st.metric(
-                    "Early Departures",
-                    f"{month2_data['Early Departure Count']}",
-                    delta=f"{early_change:+d}",
-                    help=f"Month 1: {month1_data['Early Departure Count']} | Month 2: {month2_data['Early Departure Count']}"
-                )
-            
-            # Visual comparison chart
-            st.markdown("---")
-            comparison_data = pd.DataFrame({
-                'Metric': ['Total Hours', 'Avg Daily Hours', 'Attendance Days', 'Late Count', 'Early Departure Count'],
-                month1: [
-                    month1_data['Total Hours'],
-                    month1_data['Avg Daily Hours'],
-                    month1_data['Attendance Days'],
-                    month1_data['Late Count'],
-                    month1_data['Early Departure Count']
-                ],
-                month2: [
-                    month2_data['Total Hours'],
-                    month2_data['Avg Daily Hours'],
-                    month2_data['Attendance Days'],
-                    month2_data['Late Count'],
-                    month2_data['Early Departure Count']
-                ]
-            })
-            
-            fig = go.Figure()
-            fig.add_trace(go.Bar(
-                name=month1,
-                x=comparison_data['Metric'],
-                y=comparison_data[month1],
-                marker_color='#1f77b4'
-            ))
-            fig.add_trace(go.Bar(
-                name=month2,
-                x=comparison_data['Metric'],
-                y=comparison_data[month2],
-                marker_color='#2ca02c'
-            ))
-            
-            fig.update_layout(
-                title=f'Performance Comparison: {month1} vs {month2}',
-                xaxis_title='Metric',
-                yaxis_title='Value',
-                barmode='group',
-                height=450,
-                plot_bgcolor='rgba(0,0,0,0)',
-                paper_bgcolor='rgba(0,0,0,0)'
+            selected_emp_comp = st.selectbox("Select Employee", employee_options, key="comp_emp")
+
+            # Get available months for this employee
+            emp_months = sorted(
+                monthly_df_comp[monthly_df_comp['Employee Full Name'] == selected_emp_comp]['YearMonth']
+                .unique()
+                .tolist()
             )
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption("Side-by-side comparison of key metrics across the two selected months")
-            
-            # Detailed comparison table
-            st.markdown("### Detailed Comparison")
-            comp_table = pd.DataFrame({
-                'Metric': ['Total Hours', 'Average Daily Hours', 'Attendance Days', 
-                          'Late Arrivals', 'Early Departures', 'Missing Punch-Outs'],
-                month1: [
-                    f"{month1_data['Total Hours']:.2f}h",
-                    f"{month1_data['Avg Daily Hours']:.2f}h",
-                    f"{month1_data['Attendance Days']}",
-                    f"{month1_data['Late Count']}",
-                    f"{month1_data['Early Departure Count']}",
-                    f"{month1_data['Missing Punch Out Count']}"
-                ],
-                month2: [
-                    f"{month2_data['Total Hours']:.2f}h",
-                    f"{month2_data['Avg Daily Hours']:.2f}h",
-                    f"{month2_data['Attendance Days']}",
-                    f"{month2_data['Late Count']}",
-                    f"{month2_data['Early Departure Count']}",
-                    f"{month2_data['Missing Punch Out Count']}"
-                ],
-                'Change': [
-                    f"{hours_change:+.2f}h ({hours_change_pct:+.1f}%)",
-                    f"{(month2_data['Avg Daily Hours'] - month1_data['Avg Daily Hours']):+.2f}h",
-                    f"{days_change:+d}",
-                    f"{late_change:+d}",
-                    f"{early_change:+d}",
-                    f"{(month2_data['Missing Punch Out Count'] - month1_data['Missing Punch Out Count']):+d}"
-                ]
-            })
-            st.dataframe(comp_table, use_container_width=True, hide_index=True)
+
+            if len(emp_months) < 2:
+                st.warning(f"Insufficient data for {selected_emp_comp}. Need at least 2 months of data for comparison.")
+            else:
+                default_months = emp_months[-4:] if len(emp_months) >= 4 else emp_months
+                selected_months = st.multiselect(
+                    "Select Months for Comparison (2+)",
+                    emp_months,
+                    default=default_months,
+                    key="comp_months"
+                )
+
+                if len(selected_months) < 2:
+                    st.info("Select at least two months to compare.")
+                else:
+                    selected_months = [m for m in emp_months if m in selected_months]
+                    emp_monthly = monthly_df_comp[
+                        (monthly_df_comp['Employee Full Name'] == selected_emp_comp) &
+                        (monthly_df_comp['YearMonth'].isin(selected_months))
+                    ].set_index('YearMonth').reindex(selected_months).fillna(0)
+
+                    st.markdown("---")
+                    st.markdown(f"### Comparison: {', '.join(selected_months)}")
+
+                    chart_metrics = [
+                        ('Total Hours', 'Total Hours'),
+                        ('Avg Daily Hours', 'Avg Daily Hours'),
+                        ('Attendance Days', 'Attendance Days'),
+                        ('Late Count', 'Late Arrivals'),
+                        ('Early Departure Count', 'Early Departures')
+                    ]
+
+                    fig = go.Figure()
+                    for month in selected_months:
+                        fig.add_trace(go.Bar(
+                            name=month,
+                            x=[label for _, label in chart_metrics],
+                            y=[emp_monthly.loc[month, metric] for metric, _ in chart_metrics]
+                        ))
+
+                    fig.update_layout(
+                        title=f'Performance Comparison: {selected_emp_comp}',
+                        xaxis_title='Metric',
+                        yaxis_title='Value',
+                        barmode='group',
+                        height=480,
+                        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                        plot_bgcolor='rgba(0,0,0,0)',
+                        paper_bgcolor='rgba(0,0,0,0)'
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.caption("Grouped comparison of key metrics across the selected months")
+
+                    st.markdown("### Detailed Comparison")
+                    table_metrics = [
+                        ('Total Hours', 'Total Hours', 'h', 2),
+                        ('Avg Daily Hours', 'Average Daily Hours', 'h', 2),
+                        ('Attendance Days', 'Attendance Days', '', 0),
+                        ('Late Count', 'Late Arrivals', '', 0),
+                        ('Early Departure Count', 'Early Departures', '', 0),
+                        ('Missing Punch Out Count', 'Missing Punch-Outs', '', 0)
+                    ]
+
+                    table_rows = []
+                    for metric_col, metric_label, suffix, decimals in table_metrics:
+                        row = {'Metric': metric_label}
+                        for month in selected_months:
+                            value = emp_monthly.loc[month, metric_col]
+                            if decimals == 0:
+                                display_value = f"{int(value)}{suffix}"
+                            else:
+                                display_value = f"{value:.{decimals}f}{suffix}"
+                            row[month] = display_value
+                        table_rows.append(row)
+
+                    comp_table = pd.DataFrame(table_rows)
+                    st.dataframe(comp_table, use_container_width=True, hide_index=True)
     
     # ------------------------------------------------------------------------
     # TAB 6: ANOMALY DASHBOARD
@@ -2434,7 +2756,7 @@ def main():
         available_cols = view_df.columns.tolist()
         default_cols = [
             'Employee Full Name', 'Date', 'First Punch In', 'Last Punch Out',
-            'Working Hours', 'Is Late', 'Is Early Departure', 'Shift Type'
+            'Net Working Hours', 'Meal Hours', 'Is Late', 'Is Early Departure', 'Shift Type'
         ]
         
         selected_cols = st.multiselect(
@@ -2478,11 +2800,15 @@ def main():
                 # Monthly summary
                 monthly = view_df.groupby(['Employee Full Name', 'Month']).agg({
                     'Working Hours': 'sum',
+                    'Meal Hours': 'sum',
                     'Date': 'count',
                     'Is Late': 'sum',
                     'Is Early Departure': 'sum'
                 }).reset_index()
-                monthly.columns = ['Employee', 'Month', 'Total Hours', 'Days Worked', 'Late Count', 'Early Count']
+                monthly.columns = [
+                    'Employee', 'Month', 'Total Hours', 'Total Meal Hours',
+                    'Days Worked', 'Late Count', 'Early Count'
+                ]
                 
                 csv_monthly = monthly.to_csv(index=False).encode('utf-8')
                 st.download_button(
@@ -2508,43 +2834,25 @@ def main():
         if len(employee_options) == 0:
             st.warning("No employees available for the selected filters.")
         else:
-            selected_emp_wp = st.selectbox("Select Employee", employee_options, key="wp_cal_emp")
-            
-            # Date selection
+            # Resolve current selections before rendering KPIs (values live in session_state)
+            if "wp_cal_emp" not in st.session_state or st.session_state.wp_cal_emp not in employee_options:
+                st.session_state.wp_cal_emp = employee_options[0]
+            selected_emp_wp = st.session_state.wp_cal_emp
+
             available_dates = wp_source_df[wp_source_df['Employee Full Name'] == selected_emp_wp]['Date']
+
             if len(available_dates) > 0:
                 min_date = available_dates.min()
                 max_date = available_dates.max()
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    selected_year_wp = st.selectbox(
-                        "Select Year",
-                        range(min_date.year, max_date.year + 1),
-                        index=len(range(min_date.year, max_date.year + 1)) - 1,
-                        key="wp_cal_year"
-                    )
-                
-                with col2:
-                    selected_month_wp = st.selectbox(
-                        "Select Month",
-                        range(1, 13),
-                        index=min_date.month - 1 if selected_year_wp == min_date.year else 0,
-                        key="wp_cal_month"
-                    )
+                available_years = list(range(min_date.year, max_date.year + 1))
 
-                pattern_message = get_work_pattern_context_text(selected_emp_wp)
-                if pattern_message:
-                    st.markdown(
-                        f"""
-                        <div style="background-color: #f3f6fb; border-left: 4px solid #2E86AB;
-                                    padding: 10px 14px; border-radius: 6px; color: #1a1a1a;">
-                            {pattern_message}
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
+                if "wp_cal_year" not in st.session_state or st.session_state.wp_cal_year not in available_years:
+                    st.session_state.wp_cal_year = available_years[-1]
+                selected_year_wp = st.session_state.wp_cal_year
+
+                if "wp_cal_month" not in st.session_state or not (1 <= st.session_state.wp_cal_month <= 12):
+                    st.session_state.wp_cal_month = min_date.month if selected_year_wp == min_date.year else 1
+                selected_month_wp = st.session_state.wp_cal_month
 
                 kpi_data = get_work_pattern_kpis_cached(
                     wp_source_df, selected_emp_wp, selected_year_wp, selected_month_wp
@@ -2593,11 +2901,31 @@ def main():
                 if kpi_data['worked_non_working_days'] > 0:
                     st.caption(
                         f"Worked on non-working days: {int(kpi_data['worked_non_working_days'])} "
-                        "day(s) highlighted in the calendar."
+                        "day(s). Weekend days are hidden in the calendar view."
                     )
 
                 st.markdown("---")
-                
+
+                filter_row = st.columns([2, 1, 1])
+                with filter_row[0]:
+                    st.selectbox("Select Employee", employee_options, key="wp_cal_emp")
+                with filter_row[1]:
+                    st.selectbox("Select Year", available_years, key="wp_cal_year")
+                with filter_row[2]:
+                    st.selectbox("Select Month", range(1, 13), key="wp_cal_month")
+
+                pattern_message = get_work_pattern_context_text(selected_emp_wp)
+                if pattern_message:
+                    st.markdown(
+                        f"""
+                        <div style="background-color: #f3f6fb; border-left: 4px solid #2E86AB;
+                                    padding: 10px 14px; border-radius: 6px; color: #1a1a1a; margin-top: 8px;">
+                            {pattern_message}
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+
                 # Generate calendar
                 calendar_html = get_work_pattern_calendar_cached(
                     wp_source_df,
@@ -2622,6 +2950,7 @@ def main():
                         'Half Day': '#caa531',
                         'Short Day': '#cf6d21',
                         'Absent': '#b73b3b',
+                        'Holiday': '#5c8db8',
                         'Week Off': '#7a8794',
                         'Worked on Non-Working Day': '#607d8b'
                     }
