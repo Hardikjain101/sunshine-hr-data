@@ -98,6 +98,14 @@ class Config:
         'Bethany Green': 'Medical Assistants'
     }
 
+    # Punch cleaning / meal sanity guards
+    NEAR_DUP_SECONDS = 60                  # Collapse noisy repeats within this window
+    MEAL_SANITY_HOURS = 4.0                # Upper bound for believable meal gaps
+    MEAL_REALISTIC_MAX_HOURS = 3.0         # Preferred upper bound when choosing alternates
+    ENABLE_PUNCH_CLEANING = True           # Toggle to revert to legacy per-day punch cleaning
+    ENABLE_PUNCH_SANITY_GUARD = True       # Toggle to revert to legacy pairing if needed
+    REGRESSION_CHANGE_LIMIT = 0.01         # 1% max allowed day-level changes in debug check
+
 # ============================================================================
 # HOLIDAY UTILITIES
 # ============================================================================
@@ -330,6 +338,151 @@ class DataCleaner:
 
 class FeatureEngineer:
     """Creates derived business metrics and features"""
+
+    @staticmethod
+    def _clean_punch_times(
+        punch_group: pd.DataFrame,
+        near_dup_seconds: int = Config.NEAR_DUP_SECONDS
+    ) -> Tuple[List[pd.Timestamp], Dict[str, object]]:
+        """
+        Collapse exact and near-duplicate punches for a single employee-day.
+        Preserves the very first and very last punch while removing obvious noise.
+        """
+        times = punch_group['Timestamp'].dropna().sort_values().tolist()
+        if not times:
+            return [], {
+                'raw_count': 0,
+                'clean_count': 0,
+                'removed_exact': 0,
+                'removed_near': 0,
+                'first_raw': None,
+                'last_raw': None
+            }
+
+        first_raw, last_raw = times[0], times[-1]
+        cleaned: List[pd.Timestamp] = []
+        removed_exact = 0
+        removed_near = 0
+
+        for idx, ts in enumerate(times):
+            if not cleaned:
+                cleaned.append(ts)
+                continue
+
+            diff_seconds = (ts - cleaned[-1]).total_seconds()
+            is_last_raw = (ts == last_raw)
+
+            # Exact duplicate -> drop, keep earlier metadata by default
+            if diff_seconds == 0:
+                removed_exact += 1
+                continue
+
+            # Near-duplicate noise (same direction punches) -> drop unless it's the final punch
+            if diff_seconds <= near_dup_seconds and not is_last_raw:
+                removed_near += 1
+                continue
+
+            cleaned.append(ts)
+
+        # Protect first-in and last-out explicitly
+        if cleaned[0] != first_raw:
+            cleaned.insert(0, first_raw)
+        if last_raw not in cleaned:
+            cleaned.append(last_raw)
+
+        debug_info = {
+            'raw_count': len(times),
+            'clean_count': len(cleaned),
+            'removed_exact': removed_exact,
+            'removed_near': removed_near,
+            'first_raw': first_raw,
+            'last_raw': last_raw
+        }
+        return cleaned, debug_info
+
+    @staticmethod
+    def _compute_work_and_break(punch_times: List[pd.Timestamp]) -> Dict[str, object]:
+        """
+        Pair punches sequentially (0->1, 2->3...) and compute work/break metrics.
+        """
+        work_seconds = 0.0
+        break_seconds = 0.0
+        valid_pairs = 0
+        invalid_pairs = 0
+        break_issues = 0
+        break_count = 0
+        first_valid_in = None
+        last_valid_out = None
+        max_break_gap_seconds = 0.0
+
+        for idx in range(0, len(punch_times) - 1, 2):
+            start = punch_times[idx]
+            end = punch_times[idx + 1]
+            if end > start:
+                if first_valid_in is None:
+                    first_valid_in = start
+                last_valid_out = end
+                valid_pairs += 1
+                work_seconds += (end - start).total_seconds()
+
+                next_idx = idx + 2
+                if next_idx < len(punch_times):
+                    next_in = punch_times[next_idx]
+                    if next_in > end:
+                        gap_seconds = (next_in - end).total_seconds()
+                        break_seconds += gap_seconds
+                        max_break_gap_seconds = max(max_break_gap_seconds, gap_seconds)
+                        break_count += 1
+                    else:
+                        break_issues += 1
+            else:
+                invalid_pairs += 1
+
+        meal_hours = max(0.0, break_seconds / 3600)
+        work_hours = max(0.0, work_seconds / 3600)
+
+        return {
+            'work_seconds': work_seconds,
+            'break_seconds': break_seconds,
+            'meal_hours': meal_hours,
+            'work_hours': work_hours,
+            'valid_pairs': valid_pairs,
+            'invalid_pairs': invalid_pairs,
+            'break_issues': break_issues,
+            'break_count': break_count,
+            'first_valid_in': first_valid_in,
+            'last_valid_out': last_valid_out,
+            'max_break_gap_seconds': max_break_gap_seconds
+        }
+
+    @staticmethod
+    def _try_alternate_pairing(punch_times: List[pd.Timestamp]) -> Tuple[Optional[List[pd.Timestamp]], Optional[Dict[str, object]], str]:
+        """
+        Attempt a minimal alternate pairing by dropping one interior punch that causes
+        unrealistic meal gaps while preserving first-in and last-out.
+        Returns (candidate_times, metrics, reason) or (None, None, reason) if no better option.
+        """
+        if len(punch_times) < 3:
+            return None, None, "too_few_punches"
+
+        candidates = []
+        for drop_idx in range(1, len(punch_times) - 1):  # never drop first/last
+            candidate = [ts for i, ts in enumerate(punch_times) if i != drop_idx]
+            if len(candidate) % 2 != 0:
+                continue
+            metrics = FeatureEngineer._compute_work_and_break(candidate)
+            last_out = metrics.get('last_valid_out')
+            if last_out is None or pd.isna(last_out):
+                continue
+            candidates.append((candidate, metrics, drop_idx))
+
+        if not candidates:
+            return None, None, "no_even_candidate"
+
+        # Prefer smallest meal_hours, then smallest max_break_gap_seconds
+        candidates.sort(key=lambda c: (c[1].get('meal_hours', float('inf')), c[1].get('max_break_gap_seconds', float('inf'))))
+        best_candidate, best_metrics, drop_idx = candidates[0]
+        return best_candidate, best_metrics, f"dropped_idx_{drop_idx}"
     
     @staticmethod
     def calculate_daily_attendance(df: pd.DataFrame) -> pd.DataFrame:
@@ -355,14 +508,42 @@ class FeatureEngineer:
             for date, date_group in group.groupby('Punch Date'):
                 date_group = date_group.sort_values('Timestamp')
                 raw_punch_count = len(date_group)
+                raw_day_times = date_group['Timestamp'].dropna()
+                day_first_raw = raw_day_times.iloc[0] if not raw_day_times.empty else pd.NaT
+                day_last_raw = raw_day_times.iloc[-1] if not raw_day_times.empty else pd.NaT
+                leading_meal_gap_seconds = 0.0
+                used_normal_subset = False
 
-                # Prefer Normal punches when available, fall back to all punches if none exist
+                # Prefer Normal punches when available; fall back to all punches when
+                # normal-only creates odd meal flows (common with duplicate meal toggles).
                 punch_group = date_group.copy()
                 if 'Type' in punch_group.columns:
                     type_norm = normalize_type(punch_group['Type'])
                     has_normal = (type_norm == 'normal').any()
                     if has_normal:
-                        punch_group = punch_group[(type_norm == 'normal') | (type_norm == '')]
+                        normal_group = punch_group[(type_norm == 'normal') | (type_norm == '')]
+                        if not normal_group.empty:
+                            normal_times = normal_group['Timestamp'].dropna()
+                            has_meal = (type_norm == 'meal').any()
+                            normal_odd = (len(normal_times) % 2 != 0)
+
+                            if not (has_meal and normal_odd):
+                                punch_group = normal_group
+                                used_normal_subset = True
+
+                            # If a day starts in Meal mode before the first Normal punch, treat
+                            # that lead gap as a meal interval to avoid losing valid lunch time.
+                            if (
+                                used_normal_subset and
+                                len(type_norm) > 0 and
+                                type_norm.iloc[0] == 'meal' and
+                                pd.notna(day_first_raw) and
+                                (not normal_times.empty) and
+                                (normal_times.iloc[0] > day_first_raw)
+                            ):
+                                gap_seconds = (normal_times.iloc[0] - day_first_raw).total_seconds()
+                                if 0 < gap_seconds <= (Config.MEAL_SANITY_HOURS * 3600):
+                                    leading_meal_gap_seconds = gap_seconds
                     if punch_group.empty:
                         punch_group = date_group.copy()
 
@@ -376,7 +557,18 @@ class FeatureEngineer:
                 dedupe_cols = [col for col in dedupe_cols if col in punch_group.columns]
                 if len(dedupe_cols) > 1:
                     punch_group = punch_group.drop_duplicates(subset=dedupe_cols)
-                punch_times = punch_group['Timestamp'].tolist()
+                if Config.ENABLE_PUNCH_CLEANING:
+                    punch_times, clean_debug = FeatureEngineer._clean_punch_times(punch_group)
+                else:
+                    punch_times = punch_group['Timestamp'].tolist()
+                    clean_debug = {
+                        'raw_count': len(punch_times),
+                        'clean_count': len(punch_times),
+                        'removed_exact': 0,
+                        'removed_near': 0,
+                        'first_raw': punch_times[0] if punch_times else None,
+                        'last_raw': punch_times[-1] if punch_times else None
+                    }
                 punch_count = len(punch_times)
 
                 # Count Normal punches in the sequence (if available)
@@ -385,38 +577,57 @@ class FeatureEngineer:
                 else:
                     normal_punch_count = punch_count
 
-                # Compute work/break intervals from sequential pairing
-                work_seconds = 0.0
-                break_seconds = 0.0
-                valid_pairs = 0
-                invalid_pairs = 0
-                break_issues = 0
-                break_count = 0
-                first_valid_in = None
-                last_valid_out = None
+                # Compute work/break intervals with pairing guard
+                metrics = FeatureEngineer._compute_work_and_break(punch_times)
+                work_seconds = metrics['work_seconds']
+                break_seconds = metrics['break_seconds']
+                valid_pairs = metrics['valid_pairs']
+                invalid_pairs = metrics['invalid_pairs']
+                break_issues = metrics['break_issues']
+                break_count = metrics['break_count']
+                first_valid_in = metrics['first_valid_in']
+                last_valid_out = metrics['last_valid_out']
+                max_break_gap_seconds = metrics['max_break_gap_seconds']
+                meal_hours = metrics['meal_hours']
+                alt_applied = False
+                alt_reason = None
+                guard_triggered = False
 
-                for idx in range(0, punch_count - 1, 2):
-                    start = punch_times[idx]
-                    end = punch_times[idx + 1]
-                    if end > start:
-                        if first_valid_in is None:
-                            first_valid_in = start
-                        last_valid_out = end
-                        valid_pairs += 1
-                        work_seconds += (end - start).total_seconds()
+                if Config.ENABLE_PUNCH_SANITY_GUARD:
+                    needs_guard = (
+                        (punch_count % 2 != 0) or
+                        (meal_hours > Config.MEAL_SANITY_HOURS) or
+                        ((max_break_gap_seconds / 3600) > Config.MEAL_SANITY_HOURS)
+                    )
+                    guard_triggered = needs_guard
+                    if needs_guard:
+                        alt_times, alt_metrics, alt_reason = FeatureEngineer._try_alternate_pairing(punch_times)
+                        if alt_times is not None:
+                            alt_meal_hours = alt_metrics.get('meal_hours', meal_hours)
+                            # Only adopt alternate if it shortens unrealistic meals and keeps last-out
+                            if alt_meal_hours <= min(Config.MEAL_REALISTIC_MAX_HOURS, meal_hours):
+                                punch_times = alt_times
+                                punch_count = len(punch_times)
+                                metrics = alt_metrics
+                                work_seconds = metrics['work_seconds']
+                                break_seconds = metrics['break_seconds']
+                                valid_pairs = metrics['valid_pairs']
+                                invalid_pairs = metrics['invalid_pairs']
+                                break_issues = metrics['break_issues']
+                                break_count = metrics['break_count']
+                                first_valid_in = metrics['first_valid_in']
+                                last_valid_out = metrics['last_valid_out']
+                                max_break_gap_seconds = metrics['max_break_gap_seconds']
+                                meal_hours = alt_meal_hours
+                                alt_applied = True
 
-                        next_idx = idx + 2
-                        if next_idx < punch_count:
-                            next_in = punch_times[next_idx]
-                            if next_in > end:
-                                break_seconds += (next_in - end).total_seconds()
-                                break_count += 1
-                            else:
-                                break_issues += 1
-                    else:
-                        invalid_pairs += 1
+                if used_normal_subset and leading_meal_gap_seconds > 0:
+                    break_seconds += leading_meal_gap_seconds
 
-                if punch_count > 0:
+                if pd.notna(day_first_raw):
+                    first_punch = day_first_raw
+                    last_punch = day_last_raw
+                elif punch_count > 0:
                     first_punch = punch_times[0]
                     last_punch = punch_times[-1]
                 else:
@@ -430,8 +641,8 @@ class FeatureEngineer:
                 has_punch_out = valid_pairs > 0
                 odd_punch_count = (punch_count % 2 != 0)
 
-                first_punch_in = first_valid_in if first_valid_in is not None else first_punch
-                last_punch_out = last_valid_out if last_valid_out is not None else pd.NaT
+                first_punch_in = first_punch if pd.notna(first_punch) else first_valid_in
+                last_punch_out = last_punch if pd.notna(last_punch) else last_valid_out
 
                 issue_tags = []
                 if odd_punch_count:
@@ -442,6 +653,12 @@ class FeatureEngineer:
                     issue_tags.append("invalid_break_gaps")
                 if has_punch_in and not has_punch_out:
                     issue_tags.append("missing_punch_out")
+                if alt_applied:
+                    issue_tags.append(f"alt_pairing:{alt_reason}")
+                if guard_triggered and not alt_applied:
+                    issue_tags.append(f"pairing_guard:{alt_reason or 'no_alternate'}")
+                if meal_hours > Config.MEAL_SANITY_HOURS:
+                    issue_tags.append("meal_gt_sanity")
                 
                 # Get additional info - handle missing values gracefully
                 if 'Department' in date_group.columns and pd.notna(date_group['Department'].iloc[0]):
@@ -981,6 +1198,41 @@ def get_work_pattern_calendar_cached(
     return create_work_pattern_calendar(daily_df, employee_name, year, month, kpi_data)
 
 @st.cache_data(show_spinner=False)
+def get_weekly_employee_comparison_cached(
+    daily_df: pd.DataFrame,
+    year: int,
+    month: int,
+    employee_tuple: Tuple[str, ...],
+    weekday_tuple: Tuple[str, ...]
+) -> pd.DataFrame:
+    employees = list(employee_tuple) if employee_tuple else None
+    weekdays = list(weekday_tuple) if weekday_tuple else None
+    return calculate_weekly_employee_comparison(daily_df, year, month, employees, weekdays)
+
+@st.cache_data(show_spinner=False)
+def get_lunch_break_risk_cached(
+    daily_df: pd.DataFrame,
+    year: int,
+    month: int,
+    employee_tuple: Tuple[str, ...],
+    high_work_hours: float,
+    short_lunch_minutes: int,
+    avg_lunch_warning_minutes: int,
+    long_continuous_hours: float
+) -> pd.DataFrame:
+    employees = list(employee_tuple) if employee_tuple else None
+    return calculate_lunch_break_risk(
+        daily_df=daily_df,
+        year=year,
+        month=month,
+        employees=employees,
+        high_work_hours=high_work_hours,
+        short_lunch_minutes=short_lunch_minutes,
+        avg_lunch_warning_minutes=avg_lunch_warning_minutes,
+        long_continuous_hours=long_continuous_hours
+    )
+
+@st.cache_data(show_spinner=False)
 def count_working_days(start_date, end_date) -> int:
     if start_date is None or end_date is None:
         return 0
@@ -992,6 +1244,212 @@ def count_working_days(start_date, end_date) -> int:
         (dt.weekday() < 5) and (dt.date() not in holiday_set)
         for dt in date_index
     ))
+
+# ============================================================================
+# DEBUG / VALIDATION HELPERS (opt-in)
+# ============================================================================
+
+def _build_debug_case_df() -> Tuple[pd.DataFrame, List[Dict[str, object]]]:
+    """Create a minimal dataframe for the three provided edge cases."""
+    cases = [
+        {
+            'name': 'Megan Blevins',
+            'date': '2025-06-24',
+            'times': ['07:35:00', '07:40:00', '09:30:00', '11:32:00', '11:32:00', '12:28:00', '12:28:00', '16:16:00'],
+            'expected_first': time(7, 35),
+            'expected_last': time(16, 16),
+            'expected_meal': 0.93
+        },
+        {
+            'name': 'Shelbie Clark',
+            'date': '2025-02-18',
+            'times': ['07:42:00', '11:40:00', '11:40:00', '12:40:00', '12:41:00', '17:19:00'],
+            'expected_first': time(7, 42),
+            'expected_last': time(17, 19),
+            'expected_meal': 1.00
+        },
+        {
+            'name': 'Shelbie Clark',
+            'date': '2025-05-06',
+            'times': ['07:45:00', '11:28:00', '11:28:00', '12:23:00', '12:24:00', '16:47:00'],
+            'expected_first': time(7, 45),
+            'expected_last': time(16, 47),
+            'expected_meal': 0.92
+        },
+    ]
+    rows = []
+    for idx, case in enumerate(cases, start=1):
+        for ts_str in case['times']:
+            ts = pd.to_datetime(f"{case['date']} {ts_str}")
+            rows.append({
+                'Employee Number': idx,
+                'Employee Full Name': case['name'],
+                'Punch Date': pd.to_datetime(case['date']).date(),
+                'Timestamp': ts,
+                'Missing Timestamp': False,
+                'Incomplete Employee Record': False,
+                'Duplicate Punch': False,
+                'Day of Week': ts.strftime('%A'),
+                'Type': 'Normal'
+            })
+    df = pd.DataFrame(rows)
+    # Reuse existing duplicate logic so the tests mirror the real pipeline
+    df = DataCleaner.detect_duplicates(df)
+    return df, cases
+
+
+def _calculate_with_toggle(df: pd.DataFrame, enable_cleaning: bool, enable_guard: bool) -> pd.DataFrame:
+    """Run daily calculation with temporary toggles to compare before/after behavior."""
+    prior_clean = Config.ENABLE_PUNCH_CLEANING
+    prior_guard = Config.ENABLE_PUNCH_SANITY_GUARD
+    Config.ENABLE_PUNCH_CLEANING = enable_cleaning
+    Config.ENABLE_PUNCH_SANITY_GUARD = enable_guard
+    try:
+        return FeatureEngineer.calculate_daily_attendance(df)
+    finally:
+        Config.ENABLE_PUNCH_CLEANING = prior_clean
+        Config.ENABLE_PUNCH_SANITY_GUARD = prior_guard
+
+
+def run_debug_unit_checks(tolerance: float = 0.08) -> Dict[str, object]:
+    """
+    Unit-style checks for the three provided edge cases.
+    Returns a structured report; execution is opt-in (not run in normal UI flow).
+    """
+    test_df, cases = _build_debug_case_df()
+    before_df = _calculate_with_toggle(test_df, enable_cleaning=False, enable_guard=False)
+    after_df = FeatureEngineer.calculate_daily_attendance(test_df)
+
+    results = []
+    for case in cases:
+        case_date = pd.to_datetime(case['date']).date()
+        before_row = before_df[
+            (before_df['Employee Full Name'] == case['name']) &
+            (before_df['Date'] == case_date)
+        ]
+        after_row = after_df[
+            (after_df['Employee Full Name'] == case['name']) &
+            (after_df['Date'] == case_date)
+        ]
+
+        def _safe_time(val):
+            if isinstance(val, pd.Timestamp):
+                return val.time()
+            return None
+
+        before_meal = float(before_row['Meal Hours'].iloc[0]) if not before_row.empty else None
+        after_meal = float(after_row['Meal Hours'].iloc[0]) if not after_row.empty else None
+        after_punch_count = int(after_row['Punch Count'].iloc[0]) if not after_row.empty else None
+        after_first = _safe_time(after_row['First Punch In'].iloc[0]) if not after_row.empty else None
+        after_last = _safe_time(after_row['Last Punch Out'].iloc[0]) if not after_row.empty else None
+
+        case_pass = (
+            (after_row.shape[0] == 1) and
+            (after_first == case['expected_first']) and
+            (after_last == case['expected_last']) and
+            (after_punch_count is not None and after_punch_count % 2 == 0) and
+            (after_meal is not None and abs(after_meal - case['expected_meal']) <= tolerance)
+        )
+
+        results.append({
+            'case': f"{case['name']} {case_date}",
+            'before_meal': before_meal,
+            'after_meal': after_meal,
+            'expected_meal': case['expected_meal'],
+            'after_first': after_first,
+            'after_last': after_last,
+            'expected_first': case['expected_first'],
+            'expected_last': case['expected_last'],
+            'after_punch_count': after_punch_count,
+            'pass': case_pass
+        })
+
+    return {
+        'cases': results,
+        'before_df': before_df,
+        'after_df': after_df
+    }
+
+
+def run_regression_sample(raw_df: Optional[pd.DataFrame], sample_size: int = 200) -> Dict[str, object]:
+    """
+    Compare legacy vs guarded logic on a small random sample of days.
+    Returns change ratios and flagged counts; caller decides whether to act.
+    """
+    if raw_df is None or raw_df.empty:
+        return {'sampled': 0, 'changed': 0, 'flagged': 0, 'ratio': 0.0}
+
+    keys = raw_df[['Employee Number', 'Employee Full Name', 'Punch Date']].drop_duplicates()
+    if keys.empty:
+        return {'sampled': 0, 'changed': 0, 'flagged': 0, 'ratio': 0.0}
+
+    sample_keys = keys.sample(n=min(sample_size, len(keys)), random_state=42)
+    changed = 0
+    flagged = 0
+
+    for _, key_row in sample_keys.iterrows():
+        mask = (
+            (raw_df['Employee Number'] == key_row['Employee Number']) &
+            (raw_df['Employee Full Name'] == key_row['Employee Full Name']) &
+            (raw_df['Punch Date'] == key_row['Punch Date'])
+        )
+        day_df = raw_df[mask]
+        if day_df.empty:
+            continue
+
+        legacy_df = _calculate_with_toggle(day_df, enable_cleaning=False, enable_guard=False)
+        guarded_df = FeatureEngineer.calculate_daily_attendance(day_df)
+
+        if legacy_df.empty or guarded_df.empty:
+            continue
+
+        legacy_row = legacy_df.iloc[0]
+        guarded_row = guarded_df.iloc[0]
+
+        meal_changed = not np.isclose(legacy_row['Meal Hours'], guarded_row['Meal Hours'])
+        work_changed = not np.isclose(legacy_row['Working Hours'], guarded_row['Working Hours'])
+        if meal_changed or work_changed:
+            changed += 1
+
+        issues = str(guarded_row.get('Punch Issues', ''))
+        if 'alt_pairing' in issues:
+            flagged += 1
+
+    sampled = len(sample_keys)
+    ratio = (changed / sampled) if sampled else 0.0
+    return {'sampled': sampled, 'changed': changed, 'flagged': flagged, 'ratio': ratio}
+
+
+# Optional debug hook: set DEBUG_PUNCH_FIX=1 to print quick diagnostics to console.
+if os.environ.get("DEBUG_PUNCH_FIX") == "1":
+    try:
+        dbg = run_debug_unit_checks()
+        print("DEBUG_PUNCH_FIX unit checks:")
+        for item in dbg['cases']:
+            print(
+                f" - {item['case']}: meal {item['before_meal']} -> {item['after_meal']} "
+                f"(expected {item['expected_meal']}), first {item['after_first']}, last {item['after_last']}, "
+                f"punches {item['after_punch_count']}, pass={item['pass']}"
+            )
+
+        regression_summary = {'sampled': 0, 'changed': 0, 'flagged': 0, 'ratio': 0.0}
+        try:
+            if os.path.exists(Config.DATA_FILE_PATH):
+                cleaner = DataCleaner()
+                raw_debug_df = pd.read_excel(Config.DATA_FILE_PATH)
+                raw_debug_df = cleaner.standardize_names(raw_debug_df)
+                raw_debug_df = cleaner.fill_missing_departments(raw_debug_df)
+                raw_debug_df = cleaner.clean_datetime_columns(raw_debug_df)
+                raw_debug_df = cleaner.detect_duplicates(raw_debug_df)
+                raw_debug_df = cleaner.create_data_quality_flags(raw_debug_df)
+                raw_debug_df = cleaner.clean_system_metadata(raw_debug_df)
+                regression_summary = run_regression_sample(raw_debug_df, sample_size=200)
+        except Exception as reg_ex:
+            print(f"DEBUG_PUNCH_FIX regression sample failed: {reg_ex}")
+
+        print(f"DEBUG_PUNCH_FIX regression sample: {regression_summary}")
+    except Exception as debug_ex:
+        print(f"DEBUG_PUNCH_FIX failed: {debug_ex}")
 
 # ============================================================================
 # VISUALIZATION FUNCTIONS
@@ -1187,6 +1645,561 @@ def calculate_attendance_distribution(daily_df: pd.DataFrame, employee_name: str
     distribution = distribution.sort_values('Order').drop('Order', axis=1)
     
     return distribution
+
+# ============================================================================
+# ADVANCED ANALYTICS: WEEKLY COMPARISON + LUNCH RISK
+# ============================================================================
+
+def calculate_expected_hours_for_range_filtered(
+    employee_name: str,
+    start_date: date,
+    end_date: date,
+    weekday_filter: Optional[List[str]] = None
+) -> float:
+    """
+    Expected hours helper with optional weekday filtering (e.g., Fridays only).
+    """
+    if start_date is None or end_date is None:
+        return 0.0
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+
+    if not weekday_filter:
+        return calculate_expected_hours_for_range(employee_name, start_date, end_date)
+
+    weekday_filter_set = set(weekday_filter)
+    expected_workdays, early_departure_override = get_employee_work_pattern(employee_name)
+    holiday_set = get_company_holiday_set(start_date, end_date)
+
+    total_hours = 0.0
+    current = start_date
+    while current <= end_date:
+        weekday = current.weekday()
+        weekday_name = current.strftime('%A')
+        if (
+            weekday < 5 and
+            weekday_name in weekday_filter_set and
+            weekday in expected_workdays and
+            current not in holiday_set
+        ):
+            total_hours += get_expected_daily_hours(weekday, early_departure_override)
+        current += timedelta(days=1)
+    return total_hours
+
+def calculate_weekly_employee_comparison(
+    daily_df: pd.DataFrame,
+    year: int,
+    month: int,
+    employees: Optional[List[str]] = None,
+    weekdays: Optional[List[str]] = None
+) -> pd.DataFrame:
+    """
+    Build week-wise employee comparison metrics for a selected month.
+    """
+    if daily_df is None or daily_df.empty:
+        return pd.DataFrame()
+
+    work_df = daily_df.copy()
+    work_df['Date'] = pd.to_datetime(work_df['Date'])
+    work_df = work_df[
+        (work_df['Date'].dt.year == year) &
+        (work_df['Date'].dt.month == month)
+    ].copy()
+
+    if employees:
+        work_df = work_df[work_df['Employee Full Name'].isin(employees)]
+    if weekdays:
+        work_df = work_df[work_df['Date'].dt.day_name().isin(set(weekdays))]
+
+    if work_df.empty:
+        return pd.DataFrame()
+
+    for bool_col in ['Is Late', 'Is Early Departure', 'Has Anomaly', 'Missing Punch Out']:
+        if bool_col not in work_df.columns:
+            work_df[bool_col] = False
+        work_df[bool_col] = work_df[bool_col].fillna(False).astype(bool)
+
+    if 'Working Hours' not in work_df.columns:
+        work_df['Working Hours'] = 0.0
+    if 'Meal Hours' not in work_df.columns:
+        work_df['Meal Hours'] = 0.0
+
+    work_df['Working Hours'] = pd.to_numeric(work_df['Working Hours'], errors='coerce').fillna(0.0)
+    work_df['Meal Hours'] = pd.to_numeric(work_df['Meal Hours'], errors='coerce').fillna(0.0)
+    work_df['No Lunch Day'] = work_df['Meal Hours'] <= (10 / 60)
+    work_df['High Risk No Lunch Day'] = (
+        (work_df['Working Hours'] >= 8.0) &
+        (work_df['No Lunch Day'])
+    )
+
+    work_df['Week Start'] = work_df['Date'] - pd.to_timedelta(work_df['Date'].dt.weekday, unit='D')
+    work_df['Week End'] = work_df['Week Start'] + pd.to_timedelta(4, unit='D')
+
+    weekly_df = work_df.groupby(['Employee Full Name', 'Week Start', 'Week End']).agg({
+        'Working Hours': 'sum',
+        'Date': 'nunique',
+        'Is Late': 'sum',
+        'Is Early Departure': 'sum',
+        'Has Anomaly': 'sum',
+        'Missing Punch Out': 'sum',
+        'Meal Hours': 'sum',
+        'No Lunch Day': 'sum',
+        'High Risk No Lunch Day': 'sum'
+    }).reset_index()
+
+    weekly_df.columns = [
+        'Employee Full Name', 'Week Start', 'Week End',
+        'Total Working Hours', 'Working Days',
+        'Late Days', 'Early Departure Days', 'Anomaly Days',
+        'Missing Punch-Out Days', 'Total Meal Hours',
+        'No Lunch Days', '8h+ No Lunch Days'
+    ]
+
+    month_start = date(year, month, 1)
+    month_end = date(year, month, calendar.monthrange(year, month)[1])
+
+    expected_hours = []
+    weekday_filter = weekdays if weekdays else None
+    for _, row in weekly_df.iterrows():
+        week_start = max(row['Week Start'].date(), month_start)
+        week_end = min(row['Week End'].date(), month_end)
+        expected_hours.append(
+            calculate_expected_hours_for_range_filtered(
+                employee_name=row['Employee Full Name'],
+                start_date=week_start,
+                end_date=week_end,
+                weekday_filter=weekday_filter
+            )
+        )
+
+    weekly_df['Expected Hours'] = expected_hours
+    weekly_df['Hours Gap'] = weekly_df['Total Working Hours'] - weekly_df['Expected Hours']
+    weekly_df['Overtime Hours'] = weekly_df['Hours Gap'].clip(lower=0)
+    weekly_df['Avg Meal / Day (min)'] = np.where(
+        weekly_df['Working Days'] > 0,
+        (weekly_df['Total Meal Hours'] * 60) / weekly_df['Working Days'],
+        0.0
+    )
+
+    week_starts = sorted(weekly_df['Week Start'].dropna().unique())
+    week_index_map = {ws: idx + 1 for idx, ws in enumerate(week_starts)}
+    weekly_df['Week Index'] = weekly_df['Week Start'].map(week_index_map)
+
+    def build_week_label(ws):
+        rank = week_index_map.get(ws, 0)
+        ws_ts = pd.Timestamp(ws)
+        label_start = max(ws_ts.date(), month_start)
+        label_end = min((ws_ts + pd.Timedelta(days=4)).date(), month_end)
+        return f"W{rank}: {label_start.strftime('%b %d')} - {label_end.strftime('%b %d')}"
+
+    weekly_df['Week Label'] = weekly_df['Week Start'].apply(build_week_label)
+
+    numeric_cols = [
+        'Total Working Hours', 'Expected Hours', 'Hours Gap', 'Overtime Hours',
+        'Total Meal Hours', 'Avg Meal / Day (min)'
+    ]
+    weekly_df[numeric_cols] = weekly_df[numeric_cols].round(2)
+
+    weekly_df = weekly_df.sort_values(
+        ['Week Index', 'Employee Full Name'],
+        ascending=[True, True]
+    )
+    return weekly_df
+
+def ensure_week_index_column(weekly_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure a canonical 'Week Index' column exists for downstream sorting.
+    Backward-compatible with alternate week columns from older code paths.
+    """
+    if weekly_df is None or weekly_df.empty:
+        return weekly_df
+
+    normalized_df = weekly_df.copy()
+
+    if 'Week Index' in normalized_df.columns:
+        normalized_df['Week Index'] = pd.to_numeric(
+            normalized_df['Week Index'],
+            errors='coerce'
+        )
+        return normalized_df
+
+    # 1) Preferred derivation from week-start dates (consistent with current logic)
+    week_start_candidates = ['Week Start', 'Week_Start', 'WeekStart']
+    week_start_col = next((c for c in week_start_candidates if c in normalized_df.columns), None)
+    if week_start_col is not None:
+        week_start_series = pd.to_datetime(normalized_df[week_start_col], errors='coerce')
+        unique_week_starts = sorted(week_start_series.dropna().unique().tolist())
+        week_map = {pd.Timestamp(ws): idx + 1 for idx, ws in enumerate(unique_week_starts)}
+        normalized_df['Week Index'] = week_start_series.map(week_map)
+        normalized_df['Week Index'] = pd.to_numeric(normalized_df['Week Index'], errors='coerce')
+        return normalized_df
+
+    # 2) Alternate canonical week columns from legacy/variant dataframes
+    alt_week_cols = ['Week', 'Week Number', 'Week_Number', 'Week No', 'WeekNo']
+    alt_col = next((c for c in alt_week_cols if c in normalized_df.columns), None)
+    if alt_col is not None:
+        normalized_df['Week Index'] = pd.to_numeric(normalized_df[alt_col], errors='coerce')
+        return normalized_df
+
+    # 3) Parse from labels like "W1: Jan 01 - Jan 05"
+    if 'Week Label' in normalized_df.columns:
+        parsed = pd.to_numeric(
+            normalized_df['Week Label'].astype(str).str.extract(r'W(\d+)')[0],
+            errors='coerce'
+        )
+        if parsed.notna().any():
+            normalized_df['Week Index'] = parsed
+            return normalized_df
+
+        # If labels are non-standard, keep deterministic ordering by label text
+        sorted_labels = sorted(normalized_df['Week Label'].dropna().unique().tolist())
+        label_map = {label: idx + 1 for idx, label in enumerate(sorted_labels)}
+        normalized_df['Week Index'] = normalized_df['Week Label'].map(label_map)
+        normalized_df['Week Index'] = pd.to_numeric(normalized_df['Week Index'], errors='coerce')
+        return normalized_df
+
+    # 4) Defensive fallback: stable row-order index (keeps app functional)
+    normalized_df['Week Index'] = np.arange(1, len(normalized_df) + 1, dtype=float)
+    return normalized_df
+
+def plot_weekly_comparison_heatmap(
+    weekly_df: pd.DataFrame,
+    selected_employees: Optional[List[str]] = None
+):
+    """
+    Compact week-vs-employee heatmap with HR-centric hover details.
+    """
+    if weekly_df is None or weekly_df.empty:
+        return None
+
+    employee_pool = sorted(weekly_df['Employee Full Name'].unique().tolist())
+    if selected_employees:
+        ordered_selected = [emp for emp in selected_employees if emp in set(employee_pool)]
+        remaining = [emp for emp in employee_pool if emp not in set(ordered_selected)]
+        employee_order = ordered_selected + remaining
+    else:
+        employee_order = employee_pool
+
+    week_meta = (
+        weekly_df[['Week Index', 'Week Label']]
+        .drop_duplicates()
+        .sort_values('Week Index')
+    )
+    week_labels = week_meta['Week Label'].tolist()
+
+    lookup = {}
+    for _, row in weekly_df.iterrows():
+        lookup[(row['Week Label'], row['Employee Full Name'])] = row
+
+    z_values = []
+    text_values = []
+    custom_values = []
+
+    for week_label in week_labels:
+        z_row = []
+        text_row = []
+        custom_row = []
+        for emp in employee_order:
+            key = (week_label, emp)
+            row = lookup.get(key)
+            if row is None:
+                total_hours = 0.0
+                working_days = 0
+                overtime_hours = 0.0
+                late_days = 0
+                early_days = 0
+                anomaly_days = 0
+                no_lunch_days = 0
+                avg_meal_min = 0.0
+            else:
+                total_hours = float(row['Total Working Hours'])
+                working_days = int(row['Working Days'])
+                overtime_hours = float(row['Overtime Hours'])
+                late_days = int(row['Late Days'])
+                early_days = int(row['Early Departure Days'])
+                anomaly_days = int(row['Anomaly Days'])
+                no_lunch_days = int(row['No Lunch Days'])
+                avg_meal_min = float(row['Avg Meal / Day (min)'])
+
+            z_row.append(total_hours)
+            text_row.append(f"{total_hours:.1f}h<br>{working_days}d")
+            custom_row.append([
+                working_days, overtime_hours, late_days, early_days,
+                anomaly_days, no_lunch_days, avg_meal_min
+            ])
+        z_values.append(z_row)
+        text_values.append(text_row)
+        custom_values.append(custom_row)
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z_values,
+            x=employee_order,
+            y=week_labels,
+            colorscale='YlGnBu',
+            colorbar=dict(title='Hours'),
+            text=text_values,
+            texttemplate="%{text}",
+            textfont={"size": 10},
+            customdata=custom_values,
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                "%{y}<br>"
+                "Total Hours: %{z:.1f}h<br>"
+                "Working Days: %{customdata[0]}<br>"
+                "Overtime: %{customdata[1]:.1f}h<br>"
+                "Late / Early: %{customdata[2]} / %{customdata[3]}<br>"
+                "Anomaly Days: %{customdata[4]}<br>"
+                "No Lunch Days: %{customdata[5]}<br>"
+                "Avg Meal / Day: %{customdata[6]:.1f} min"
+                "<extra></extra>"
+            )
+        )
+    )
+
+    fig.update_layout(
+        title='Weekly Employee Comparison (Hours + Presence Signal)',
+        xaxis_title='Employee',
+        yaxis_title='Week of Month',
+        height=max(420, len(week_labels) * 65),
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)'
+    )
+    fig.update_yaxes(autorange='reversed')
+    return fig
+
+def _longest_true_streak(flags: pd.Series) -> int:
+    """
+    Return the longest consecutive streak of truthy values.
+    """
+    max_streak = 0
+    current_streak = 0
+    for val in flags.fillna(False).tolist():
+        if bool(val):
+            current_streak += 1
+            max_streak = max(max_streak, current_streak)
+        else:
+            current_streak = 0
+    return max_streak
+
+def calculate_lunch_break_risk(
+    daily_df: pd.DataFrame,
+    year: int,
+    month: int,
+    employees: Optional[List[str]] = None,
+    high_work_hours: float = 8.0,
+    short_lunch_minutes: int = 20,
+    avg_lunch_warning_minutes: int = 25,
+    long_continuous_hours: float = 6.0
+) -> pd.DataFrame:
+    """
+    Build monthly lunch-break behavior and risk profile per employee.
+    """
+    if daily_df is None or daily_df.empty:
+        return pd.DataFrame()
+
+    work_df = daily_df.copy()
+    work_df['Date'] = pd.to_datetime(work_df['Date'])
+    work_df = work_df[
+        (work_df['Date'].dt.year == year) &
+        (work_df['Date'].dt.month == month)
+    ].copy()
+
+    if employees:
+        work_df = work_df[work_df['Employee Full Name'].isin(employees)]
+    if work_df.empty:
+        return pd.DataFrame()
+
+    if 'Working Hours' not in work_df.columns:
+        work_df['Working Hours'] = 0.0
+    if 'Meal Hours' not in work_df.columns:
+        work_df['Meal Hours'] = 0.0
+
+    work_df['Working Hours'] = pd.to_numeric(work_df['Working Hours'], errors='coerce').fillna(0.0)
+    work_df['Meal Hours'] = pd.to_numeric(work_df['Meal Hours'], errors='coerce').fillna(0.0)
+    work_df = work_df[work_df['Working Hours'] > 0].copy()
+    if work_df.empty:
+        return pd.DataFrame()
+
+    if 'Break Count' in work_df.columns:
+        break_counts = pd.to_numeric(work_df['Break Count'], errors='coerce').fillna(0)
+    else:
+        break_counts = pd.Series(0, index=work_df.index)
+
+    work_df['Meal Minutes'] = work_df['Meal Hours'] * 60
+    work_df['No Lunch Day'] = work_df['Meal Minutes'] <= 1
+    work_df['Short Lunch Day'] = (
+        (work_df['Meal Minutes'] > 1) &
+        (work_df['Meal Minutes'] < short_lunch_minutes)
+    )
+    work_df['High-Risk No Lunch Day'] = (
+        (work_df['Working Hours'] >= high_work_hours) &
+        (work_df['No Lunch Day'])
+    )
+    work_df['Long Continuous Work Day'] = (
+        ((break_counts <= 0) & (work_df['Working Hours'] >= long_continuous_hours)) |
+        ((work_df['Meal Minutes'] < max(10, short_lunch_minutes * 0.5)) & (work_df['Working Hours'] >= high_work_hours))
+    )
+
+    risk_rows = []
+    for employee_name, emp_df in work_df.groupby('Employee Full Name'):
+        emp_df = emp_df.sort_values('Date')
+        working_days = int(emp_df['Date'].nunique())
+        total_work_hours = float(emp_df['Working Hours'].sum())
+        total_meal_hours = float(emp_df['Meal Hours'].sum())
+        avg_lunch_minutes = (total_meal_hours * 60 / working_days) if working_days > 0 else 0.0
+
+        no_lunch_days = int(emp_df['No Lunch Day'].sum())
+        short_lunch_days = int(emp_df['Short Lunch Day'].sum())
+        long_continuous_days = int(emp_df['Long Continuous Work Day'].sum())
+        high_risk_days = int(emp_df['High-Risk No Lunch Day'].sum())
+        max_no_lunch_streak = _longest_true_streak(emp_df['No Lunch Day'])
+        max_high_risk_streak = _longest_true_streak(emp_df['High-Risk No Lunch Day'])
+
+        risk_score = 0
+        risk_score += high_risk_days * 2
+        risk_score += 2 if avg_lunch_minutes < avg_lunch_warning_minutes else 0
+        risk_score += 2 if no_lunch_days >= 3 else 0
+        risk_score += 2 if short_lunch_days >= 4 else 0
+        risk_score += 2 if long_continuous_days >= 3 else 0
+        risk_score += 3 if max_high_risk_streak >= 3 else 0
+
+        if max_high_risk_streak >= 3 or high_risk_days >= 5 or avg_lunch_minutes < 10:
+            risk_level = 'Critical'
+        elif risk_score >= 8 or high_risk_days >= 3:
+            risk_level = 'High'
+        elif risk_score >= 4 or avg_lunch_minutes < avg_lunch_warning_minutes:
+            risk_level = 'Warning'
+        else:
+            risk_level = 'Low'
+
+        reasons = []
+        if high_risk_days > 0:
+            reasons.append(f"{high_risk_days} day(s) worked {high_work_hours:.1f}h+ with no lunch")
+        if avg_lunch_minutes < avg_lunch_warning_minutes:
+            reasons.append(f"Average lunch is only {avg_lunch_minutes:.1f} min")
+        if max_high_risk_streak >= 2:
+            reasons.append(f"{max_high_risk_streak}-day consecutive high-risk streak")
+        if long_continuous_days > 0:
+            reasons.append(f"{long_continuous_days} long continuous-work day(s)")
+        if not reasons:
+            reasons.append("Lunch behavior appears stable in this month.")
+
+        risk_rows.append({
+            'Employee Full Name': employee_name,
+            'Working Days': working_days,
+            'Total Working Hours': round(total_work_hours, 2),
+            'Total Meal Hours': round(total_meal_hours, 2),
+            'Avg Lunch Minutes': round(avg_lunch_minutes, 2),
+            'No Lunch Days': no_lunch_days,
+            'Short Lunch Days': short_lunch_days,
+            'Long Continuous Work Days': long_continuous_days,
+            'High-Risk No Lunch Days': high_risk_days,
+            'Max No Lunch Streak': max_no_lunch_streak,
+            'Max High-Risk Streak': max_high_risk_streak,
+            'Risk Score': int(risk_score),
+            'Risk Level': risk_level,
+            'Risk Drivers': '; '.join(reasons[:3])
+        })
+
+    risk_df = pd.DataFrame(risk_rows)
+    if risk_df.empty:
+        return risk_df
+
+    severity_order = {'Critical': 0, 'High': 1, 'Warning': 2, 'Low': 3}
+    risk_df['Risk Order'] = risk_df['Risk Level'].map(severity_order).fillna(99)
+    risk_df = risk_df.sort_values(
+        ['Risk Order', 'Risk Score', 'High-Risk No Lunch Days', 'No Lunch Days'],
+        ascending=[True, False, False, False]
+    ).drop(columns=['Risk Order'])
+    return risk_df
+
+def plot_lunch_risk_bar_chart(risk_df: pd.DataFrame, top_n: int = 15):
+    """
+    Horizontal bar chart ranking employees by lunch-break risk score.
+    """
+    if risk_df is None or risk_df.empty:
+        return None
+
+    chart_df = risk_df.head(top_n).sort_values('Risk Score', ascending=True)
+    color_map = {
+        'Critical': '#b42323',
+        'High': '#e67e22',
+        'Warning': '#caa531',
+        'Low': '#2f9e44'
+    }
+
+    fig = px.bar(
+        chart_df,
+        x='Risk Score',
+        y='Employee Full Name',
+        orientation='h',
+        color='Risk Level',
+        color_discrete_map=color_map,
+        hover_data={
+            'High-Risk No Lunch Days': True,
+            'No Lunch Days': True,
+            'Short Lunch Days': True,
+            'Avg Lunch Minutes': ':.1f',
+            'Risk Score': True
+        },
+        title=f'Top {min(top_n, len(chart_df))} Employees by Lunch Risk Score'
+    )
+    fig.update_layout(
+        height=max(420, len(chart_df) * 32),
+        xaxis_title='Risk Score',
+        yaxis_title='Employee',
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)'
+    )
+    return fig
+
+def plot_lunch_risk_scatter(risk_df: pd.DataFrame, avg_lunch_warning_minutes: int = 25):
+    """
+    Relationship view: work volume vs lunch quality, by risk level.
+    """
+    if risk_df is None or risk_df.empty:
+        return None
+
+    color_map = {
+        'Critical': '#b42323',
+        'High': '#e67e22',
+        'Warning': '#caa531',
+        'Low': '#2f9e44'
+    }
+
+    fig = px.scatter(
+        risk_df,
+        x='Total Working Hours',
+        y='Avg Lunch Minutes',
+        size='No Lunch Days',
+        color='Risk Level',
+        hover_name='Employee Full Name',
+        hover_data={
+            'Risk Score': True,
+            'Working Days': True,
+            'High-Risk No Lunch Days': True,
+            'Long Continuous Work Days': True,
+            'No Lunch Days': True
+        },
+        color_discrete_map=color_map,
+        title='Lunch Risk Positioning: Workload vs Meal Recovery'
+    )
+    fig.add_hline(
+        y=avg_lunch_warning_minutes,
+        line_dash='dash',
+        line_color='#cf6d21',
+        annotation_text=f'Warning threshold: {avg_lunch_warning_minutes} min',
+        annotation_position='bottom right'
+    )
+    fig.update_layout(
+        height=460,
+        xaxis_title='Total Working Hours (Month)',
+        yaxis_title='Average Lunch per Working Day (min)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)'
+    )
+    return fig
 
 def create_attendance_calendar(daily_df: pd.DataFrame, employee_name: str, year: int, month: int):
     """
@@ -1566,10 +2579,26 @@ def calculate_work_pattern_kpis(daily_df: pd.DataFrame, employee_name: str, year
         late_count = int(late_series.sum())
         early_count = int(early_series.sum())
         on_time_days = int((~late_series & ~early_series).sum())
+
+        work_hours_series = pd.to_numeric(expected_df['Working Hours'], errors='coerce').fillna(0.0)
+        if 'Meal Hours' in expected_df.columns:
+            meal_hours_series = pd.to_numeric(expected_df['Meal Hours'], errors='coerce').fillna(0.0)
+        else:
+            meal_hours_series = pd.Series(0.0, index=expected_df.index)
+
+        # Working-day lunch KPIs (expected workdays only -> excludes holidays and week-offs)
+        worked_day_mask = work_hours_series > 0
+        no_lunch_mask = meal_hours_series <= 0
+        no_lunch_working_days = int((worked_day_mask & no_lunch_mask).sum())
+        high_risk_no_lunch_days = int(
+            (worked_day_mask & (work_hours_series >= 8.0) & no_lunch_mask).sum()
+        )
     else:
         late_count = 0
         early_count = 0
         on_time_days = 0
+        no_lunch_working_days = 0
+        high_risk_no_lunch_days = 0
 
     return {
         'expected_days': expected_days,
@@ -1582,7 +2611,9 @@ def calculate_work_pattern_kpis(daily_df: pd.DataFrame, employee_name: str, year
         'late_arrivals': late_count,
         'early_departures': early_count,
         'on_time_days': on_time_days,
-        'worked_non_working_days': len(non_working_df)
+        'worked_non_working_days': len(non_working_df),
+        'high_risk_no_lunch_days': high_risk_no_lunch_days,
+        'no_lunch_working_days': no_lunch_working_days
     }
 
 def create_work_pattern_calendar(
@@ -2219,6 +3250,7 @@ def main():
         ]
     
     # Department filter (multi-select)
+    selected_depts = []
     if 'Department' in daily_df.columns:
         dept_options = sorted(daily_filtered['Department'].dropna().unique().tolist())
         selected_depts = st.sidebar.multiselect("Select Department", dept_options)
@@ -2297,12 +3329,14 @@ def main():
     # ========================================================================
     
     
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "\U0001F3AF Productivity",
         "\U0001F4C8 Overtime Analysis",
         "\U0001F4C8 Monthly Performance",
         "\U0001F4CA Month-to-Month Comparison",
         "\U0001F5D3 Work Pattern Calendar",
+        "\U0001F5D3 Week-Wise Comparison",
+        "\U0001F37D Lunch Risk",
         "\u26A0 Anomalies",
         "\U0001F4CA Data Table",
     ])
@@ -2709,9 +3743,307 @@ def main():
                     st.dataframe(comp_table, use_container_width=True, hide_index=True)
     
     # ------------------------------------------------------------------------
-    # TAB 6: ANOMALY DASHBOARD
+    # TAB 6: WEEK-WISE EMPLOYEE COMPARISON
     # ------------------------------------------------------------------------
     with tab6:
+        st.subheader("\U0001F5D3 Week-Wise Employee Comparison")
+        st.markdown("**Compare employees by weekly patterns instead of daily noise.**")
+
+        week_source_df = daily_df.copy()
+        week_source_df['Date'] = pd.to_datetime(week_source_df['Date'])
+        if selected_depts and 'Department' in week_source_df.columns:
+            week_source_df = week_source_df[week_source_df['Department'].isin(selected_depts)]
+        if selected_employees:
+            week_source_df = week_source_df[week_source_df['Employee Full Name'].isin(selected_employees)]
+
+        if week_source_df.empty:
+            st.warning("No data available for week-wise comparison under the current filters.")
+        else:
+            st.caption("This view uses month/year controls and summarizes attendance week-by-week.")
+
+            available_years = sorted(week_source_df['Date'].dt.year.unique().tolist(), reverse=True)
+            ctrl1, ctrl2, ctrl3 = st.columns([1, 1, 2])
+            with ctrl1:
+                selected_year_week = st.selectbox(
+                    "Select Year",
+                    available_years,
+                    key="wk_cmp_year"
+                )
+            with ctrl2:
+                available_months_week = sorted(
+                    week_source_df[week_source_df['Date'].dt.year == selected_year_week]['Date'].dt.month.unique().tolist()
+                )
+                selected_month_week = st.selectbox(
+                    "Select Month",
+                    available_months_week,
+                    format_func=lambda x: calendar.month_name[x],
+                    key="wk_cmp_month"
+                )
+            with ctrl3:
+                weekday_options = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+                selected_weekdays = st.multiselect(
+                    "Weekday Focus (Optional)",
+                    weekday_options,
+                    default=weekday_options,
+                    key="wk_cmp_weekdays"
+                )
+
+            employee_options_week = sorted(
+                week_source_df[
+                    (week_source_df['Date'].dt.year == selected_year_week) &
+                    (week_source_df['Date'].dt.month == selected_month_week)
+                ]['Employee Full Name'].unique().tolist()
+            )
+            default_week_employees = (
+                [emp for emp in selected_employees if emp in set(employee_options_week)][:10]
+                if selected_employees else employee_options_week[:min(5, len(employee_options_week))]
+            )
+            selected_week_employees = st.multiselect(
+                "Select Employees for Weekly Comparison (up to 10)",
+                employee_options_week,
+                default=default_week_employees,
+                key="wk_cmp_employees"
+            )
+
+            if len(selected_week_employees) > 10:
+                st.warning("Showing first 10 selected employees for readability.")
+                selected_week_employees = selected_week_employees[:10]
+
+            weekday_scope = selected_weekdays if selected_weekdays else weekday_options
+            if len(selected_week_employees) == 0:
+                st.info("Select at least one employee to render week-wise comparison.")
+            else:
+                weekly_comp_df = get_weekly_employee_comparison_cached(
+                    week_source_df,
+                    selected_year_week,
+                    selected_month_week,
+                    tuple(selected_week_employees),
+                    tuple(weekday_scope)
+                )
+                weekly_comp_df = ensure_week_index_column(weekly_comp_df)
+
+                if weekly_comp_df.empty:
+                    st.info("No weekly comparison data available for the current month and selection.")
+                else:
+                    kpi_a, kpi_b, kpi_c, kpi_d = st.columns(4)
+                    with kpi_a:
+                        create_metric_card("Employee-Weeks", int(len(weekly_comp_df)))
+                    with kpi_b:
+                        create_metric_card("Avg Hours / Employee-Week", f"{weekly_comp_df['Total Working Hours'].mean():.1f}h")
+                    with kpi_c:
+                        create_metric_card("Total Overtime", f"{weekly_comp_df['Overtime Hours'].sum():.1f}h")
+                    with kpi_d:
+                        flagged_weeks = (
+                            (weekly_comp_df['Anomaly Days'] > 0) |
+                            (weekly_comp_df['Late Days'] > 0) |
+                            (weekly_comp_df['Early Departure Days'] > 0)
+                        ).sum()
+                        create_metric_card("Flagged Weeks", int(flagged_weeks))
+
+                    week_heatmap = plot_weekly_comparison_heatmap(
+                        weekly_comp_df,
+                        selected_week_employees
+                    )
+                    if week_heatmap is not None:
+                        st.plotly_chart(week_heatmap, use_container_width=True)
+                    st.caption("Cell text shows total hours + worked days. Hover for overtime, timing, anomalies, and lunch signals.")
+
+                    st.markdown("### Weekly Matrix Snapshot")
+                    snapshot_df = weekly_comp_df.copy()
+                    snapshot_df['Summary'] = snapshot_df.apply(
+                        lambda r: (
+                            f"{r['Total Working Hours']:.1f}h | {int(r['Working Days'])}d | "
+                            f"OT {r['Overtime Hours']:.1f}h | A {int(r['Anomaly Days'])}"
+                        ),
+                        axis=1
+                    )
+                    week_order = (
+                        snapshot_df[['Week Index', 'Week Label']]
+                        .drop_duplicates()
+                        .sort_values('Week Index')['Week Label']
+                        .tolist()
+                    )
+                    matrix_df = snapshot_df.pivot(
+                        index='Week Label',
+                        columns='Employee Full Name',
+                        values='Summary'
+                    ).reindex(week_order)
+                    ordered_cols = [emp for emp in selected_week_employees if emp in matrix_df.columns]
+                    ordered_cols += [col for col in matrix_df.columns if col not in set(ordered_cols)]
+                    matrix_df = matrix_df[ordered_cols]
+                    st.dataframe(matrix_df.fillna("-"), use_container_width=True)
+
+                    st.markdown("### Weekly Detailed Metrics")
+                    detail_cols = [
+                        'Week Label', 'Employee Full Name', 'Total Working Hours', 'Expected Hours',
+                        'Overtime Hours', 'Working Days', 'Late Days', 'Early Departure Days',
+                        'Anomaly Days', 'No Lunch Days', '8h+ No Lunch Days', 'Avg Meal / Day (min)'
+                    ]
+                    sort_cols = ['Total Working Hours']
+                    sort_ascending = [False]
+                    if 'Week Index' in weekly_comp_df.columns:
+                        sort_cols = ['Week Index', 'Total Working Hours']
+                        sort_ascending = [True, False]
+                    st.dataframe(
+                        weekly_comp_df.sort_values(
+                            sort_cols,
+                            ascending=sort_ascending
+                        )[detail_cols],
+                        use_container_width=True,
+                        height=420
+                    )
+
+    # ------------------------------------------------------------------------
+    # TAB 7: LUNCH RISK & BEHAVIOR ANALYSIS
+    # ------------------------------------------------------------------------
+    with tab7:
+        st.subheader("\U0001F37D Lunch Break Risk & Behavior Analysis")
+        st.markdown("**Identify employees with unhealthy break patterns and sustained no-lunch workdays.**")
+
+        risk_source_df = daily_df.copy()
+        risk_source_df['Date'] = pd.to_datetime(risk_source_df['Date'])
+        if selected_depts and 'Department' in risk_source_df.columns:
+            risk_source_df = risk_source_df[risk_source_df['Department'].isin(selected_depts)]
+        if selected_employees:
+            risk_source_df = risk_source_df[risk_source_df['Employee Full Name'].isin(selected_employees)]
+
+        if risk_source_df.empty:
+            st.warning("No data available for lunch risk analysis under the current filters.")
+        else:
+            available_years_risk = sorted(risk_source_df['Date'].dt.year.unique().tolist(), reverse=True)
+            rcol1, rcol2 = st.columns(2)
+            with rcol1:
+                selected_year_risk = st.selectbox("Select Year", available_years_risk, key="risk_year")
+            with rcol2:
+                available_months_risk = sorted(
+                    risk_source_df[risk_source_df['Date'].dt.year == selected_year_risk]['Date'].dt.month.unique().tolist()
+                )
+                selected_month_risk = st.selectbox(
+                    "Select Month",
+                    available_months_risk,
+                    format_func=lambda x: calendar.month_name[x],
+                    key="risk_month"
+                )
+
+            employee_options_risk = sorted(
+                risk_source_df[
+                    (risk_source_df['Date'].dt.year == selected_year_risk) &
+                    (risk_source_df['Date'].dt.month == selected_month_risk)
+                ]['Employee Full Name'].unique().tolist()
+            )
+            default_risk_employees = (
+                [emp for emp in selected_employees if emp in set(employee_options_risk)]
+                if selected_employees else employee_options_risk
+            )
+            selected_risk_employees = st.multiselect(
+                "Select Employees for Risk Analysis",
+                employee_options_risk,
+                default=default_risk_employees,
+                key="risk_employees"
+            )
+
+            with st.expander("Risk Thresholds", expanded=False):
+                high_work_hours = st.slider(
+                    "High Workday Threshold (hours)",
+                    min_value=6.0,
+                    max_value=12.0,
+                    value=8.0,
+                    step=0.5,
+                    key="risk_high_work_hours"
+                )
+                short_lunch_minutes = st.slider(
+                    "Extremely Short Lunch Threshold (minutes)",
+                    min_value=5,
+                    max_value=45,
+                    value=20,
+                    step=5,
+                    key="risk_short_lunch_minutes"
+                )
+                avg_lunch_warning_minutes = st.slider(
+                    "Average Lunch Warning Threshold (minutes)",
+                    min_value=10,
+                    max_value=60,
+                    value=25,
+                    step=5,
+                    key="risk_avg_warning_minutes"
+                )
+                long_continuous_hours = st.slider(
+                    "Long Continuous Work Threshold (hours)",
+                    min_value=4.0,
+                    max_value=10.0,
+                    value=6.0,
+                    step=0.5,
+                    key="risk_long_continuous_hours"
+                )
+
+            if len(selected_risk_employees) == 0:
+                st.info("Select at least one employee to run lunch risk analysis.")
+            else:
+                lunch_risk_df = get_lunch_break_risk_cached(
+                    risk_source_df,
+                    selected_year_risk,
+                    selected_month_risk,
+                    tuple(selected_risk_employees),
+                    float(high_work_hours),
+                    int(short_lunch_minutes),
+                    int(avg_lunch_warning_minutes),
+                    float(long_continuous_hours)
+                )
+
+                if lunch_risk_df.empty:
+                    st.info("No lunch risk records found for this month and employee set.")
+                else:
+                    c1, c2, c3, c4, c5 = st.columns(5)
+                    with c1:
+                        create_metric_card("Critical", int((lunch_risk_df['Risk Level'] == 'Critical').sum()))
+                    with c2:
+                        create_metric_card("High", int((lunch_risk_df['Risk Level'] == 'High').sum()))
+                    with c3:
+                        create_metric_card("Warning", int((lunch_risk_df['Risk Level'] == 'Warning').sum()))
+                    with c4:
+                        create_metric_card("8h+ No-Lunch Days", int(lunch_risk_df['High-Risk No Lunch Days'].sum()))
+                    with c5:
+                        create_metric_card("Avg Lunch (Team)", f"{lunch_risk_df['Avg Lunch Minutes'].mean():.1f} min")
+
+                    fig_left, fig_right = st.columns(2)
+                    with fig_left:
+                        risk_bar = plot_lunch_risk_bar_chart(lunch_risk_df, top_n=15)
+                        if risk_bar is not None:
+                            st.plotly_chart(risk_bar, use_container_width=True)
+                    with fig_right:
+                        risk_scatter = plot_lunch_risk_scatter(
+                            lunch_risk_df,
+                            avg_lunch_warning_minutes=avg_lunch_warning_minutes
+                        )
+                        if risk_scatter is not None:
+                            st.plotly_chart(risk_scatter, use_container_width=True)
+
+                    priority_df = lunch_risk_df[lunch_risk_df['Risk Level'].isin(['Critical', 'High'])]
+                    if len(priority_df) > 0:
+                        st.warning(
+                            "Priority follow-up: " +
+                            ", ".join(priority_df['Employee Full Name'].head(8).tolist())
+                        )
+                    else:
+                        st.success("No high-severity lunch-break risks identified in this month.")
+
+                    st.markdown("### Risk Detail Table")
+                    risk_cols = [
+                        'Employee Full Name', 'Risk Level', 'Risk Score', 'Working Days',
+                        'Total Working Hours', 'Total Meal Hours', 'Avg Lunch Minutes',
+                        'No Lunch Days', 'Short Lunch Days', 'Long Continuous Work Days',
+                        'High-Risk No Lunch Days', 'Max No Lunch Streak', 'Risk Drivers'
+                    ]
+                    st.dataframe(
+                        lunch_risk_df[risk_cols],
+                        use_container_width=True,
+                        height=460
+                    )
+
+    # ------------------------------------------------------------------------
+    # TAB 8: ANOMALY DASHBOARD
+    # ------------------------------------------------------------------------
+    with tab8:
         st.subheader("\u26A0 Anomaly Detection & Analysis")
         
         # Anomaly summary
@@ -2747,9 +4079,9 @@ def main():
             st.success("No anomalies detected in selected period!")
     
     # ------------------------------------------------------------------------
-    # TAB 7: DATA TABLE & EXPORT
+    # TAB 9: DATA TABLE & EXPORT
     # ------------------------------------------------------------------------
-    with tab7:
+    with tab9:
         st.subheader("\U0001F4CA Attendance Data Table")
         
         # Column selector
@@ -2897,6 +4229,20 @@ def main():
                     create_metric_card("Early Departures", int(kpi_data['early_departures']))
                 with kpi_row3[2]:
                     create_metric_card("On-Time Days", int(kpi_data['on_time_days']))
+
+                kpi_row4 = st.columns(2)
+                with kpi_row4[0]:
+                    create_metric_card(
+                        "High-Risk No-Lunch Days",
+                        int(kpi_data.get('high_risk_no_lunch_days', 0)),
+                        help_text="Expected workdays only: Working Hours >= 8 and Meal Hours = 0."
+                    )
+                with kpi_row4[1]:
+                    create_metric_card(
+                        "No-Lunch Working Days",
+                        int(kpi_data.get('no_lunch_working_days', 0)),
+                        help_text="Expected workdays only: any worked hours with Meal Hours = 0."
+                    )
 
                 if kpi_data['worked_non_working_days'] > 0:
                     st.caption(
