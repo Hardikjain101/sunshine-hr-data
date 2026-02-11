@@ -21,6 +21,7 @@ from typing import Tuple, Dict, List, Optional
 import calendar
 import warnings
 import os
+import shutil
 from functools import lru_cache
 warnings.filterwarnings('ignore')
 
@@ -33,6 +34,7 @@ class Config:
     
     # Persistent Storage
     DATA_FILE_PATH = "attendance_data.xlsx"
+    CACHE_VERSION = "2026-02-07"
     
     # Department Auto-Mapping
     DEPARTMENT_MAPPING = {
@@ -79,6 +81,11 @@ class Config:
     MAX_WORK_HOURS = 10.0                  # Maximum reasonable hours
     HALF_DAY_THRESHOLD = 5.0               # Hours for half-day
     FULL_DAY_THRESHOLD = 8.0               # Hours for full-day
+
+    # Meal-risk visual thresholds (calendar cues only)
+    MEAL_RISK_LONG_DAY_HOURS = 8.0         # Long day threshold for risk cues
+    MEAL_RISK_WARNING_MINUTES = 30         # Warning if meal is shorter than this
+    MEAL_RISK_CRITICAL_MINUTES = 1         # Critical if meal is essentially zero
     
     # Overtime thresholds
     WEEKLY_STANDARD_HOURS = 40.0           # Weekly standard hours
@@ -1087,13 +1094,29 @@ class DataManager:
             target_engine = DataManager._get_excel_engine(target_ext.lower())
             with pd.ExcelWriter(temp_path, engine=target_engine) as writer:
                 combined_df.to_excel(writer, index=False)
+            # Validate temp output before replacing production file
+            _read_excel_file(temp_path, sample_only=True)
+
+            backup_path = _get_backup_path(target_path)
+            if os.path.exists(target_path):
+                try:
+                    shutil.copy2(target_path, backup_path)
+                except Exception:
+                    pass
             os.replace(temp_path, target_path)
+            # Validate final file and roll back if write became corrupted
+            _read_excel_file(target_path, sample_only=True)
             return True
             
         except Exception as e:
             try:
                 if 'temp_path' in locals() and os.path.exists(temp_path):
                     os.remove(temp_path)
+            except Exception:
+                pass
+            try:
+                if 'backup_path' in locals() and os.path.exists(backup_path):
+                    shutil.copy2(backup_path, target_path)
             except Exception:
                 pass
             st.error(f"Error saving data: {str(e)}")
@@ -1103,66 +1126,227 @@ class DataManager:
 # DATA LOADING & PROCESSING PIPELINE
 # ============================================================================
 
-@st.cache_data(show_spinner=False)
-def load_and_process_data(uploaded_file) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def _get_backup_path(path: str) -> str:
+    base_path, ext = os.path.splitext(path)
+    return f"{base_path}.bak{ext}"
+
+def _read_excel_file(path: str, sample_only: bool = False) -> pd.DataFrame:
+    """
+    Read an Excel file with extension-aware engine fallback.
+    Raises a clean ValueError for corrupted zip/compression payloads.
+    """
+    ext = DataManager._get_excel_extension(path)
+    engine = DataManager._get_excel_engine(ext)
+    read_kwargs = {"nrows": 5} if sample_only else {}
+    errors: List[Exception] = []
+
+    if engine:
+        try:
+            return pd.read_excel(path, engine=engine, **read_kwargs)
+        except Exception as ex:
+            errors.append(ex)
+
+    try:
+        return pd.read_excel(path, **read_kwargs)
+    except Exception as ex:
+        errors.append(ex)
+
+    error_text = " | ".join(str(err) for err in errors)
+    lowered = error_text.lower()
+    if "error -3" in lowered or "decompressing data" in lowered or "zlib" in lowered:
+        raise ValueError(f"Data file '{os.path.basename(path)}' is corrupted or partially written.")
+    raise ValueError(f"Unable to read Excel file '{os.path.basename(path)}'. {error_text}")
+
+def _restore_data_file_from_backup(target_path: str) -> bool:
+    """
+    Restore the primary data file from its backup if the backup is valid.
+    """
+    backup_path = _get_backup_path(target_path)
+    if not os.path.exists(backup_path):
+        return False
+
+    try:
+        _read_excel_file(backup_path, sample_only=True)
+    except Exception:
+        return False
+
+    restore_tmp = f"{target_path}.restore_tmp"
+    try:
+        shutil.copy2(backup_path, restore_tmp)
+        os.replace(restore_tmp, target_path)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(restore_tmp):
+                os.remove(restore_tmp)
+        except Exception:
+            pass
+        return False
+
+def _get_data_source_signature(path: str) -> str:
+    """
+    Build a deterministic signature for cache invalidation based on file metadata.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return "missing"
+    return f"{stat.st_mtime_ns}-{stat.st_size}"
+
+def _ensure_cache_version() -> None:
+    """
+    Clear cached artifacts when the cache schema version changes.
+    Uses a small on-disk version marker to persist across sessions.
+    """
+    version_path = os.path.join(os.path.dirname(__file__), ".cache_version")
+    last_version = None
+    try:
+        if os.path.exists(version_path):
+            with open(version_path, "r", encoding="utf-8") as handle:
+                last_version = handle.read().strip()
+    except OSError:
+        last_version = None
+
+    if last_version != Config.CACHE_VERSION:
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        try:
+            with open(version_path, "w", encoding="utf-8") as handle:
+                handle.write(Config.CACHE_VERSION)
+        except OSError:
+            # If we can't write the version marker, proceed without failing
+            pass
+
+def _clear_all_caches() -> None:
+    """Clear both data and resource caches in one place."""
+    st.cache_data.clear()
+    st.cache_resource.clear()
+
+def _is_cache_corruption_error(message: str) -> bool:
+    """Detect known cache corruption/decompression signatures."""
+    text = str(message or "").lower()
+    signatures = (
+        "error -3",
+        "decompressing data",
+        "invalid literal/lengths set",
+        "pickle data was truncated",
+        "unpickling",
+        "invalid load key",
+        "zlib",
+        "corrupted or partially written",
+        "processed data is missing required tables",
+        "processed daily data is missing required columns",
+        "processed aggregate tables are incomplete"
+    )
+    return any(sig in text for sig in signatures)
+
+def _validate_raw_df(raw_df: pd.DataFrame) -> None:
+    """
+    Defensive validation to detect corrupted or incompatible data reads.
+    """
+    if raw_df is None or raw_df.empty:
+        raise ValueError("Uploaded file produced no readable rows.")
+
+    required_any_time = {'Actual Date Time', 'Punch Date Time', 'Created Date Time (UTC)'}
+    required_any_employee = {'Employee Number', 'Employee First Name', 'Employee Last Name', 'Employee Full Name'}
+
+    if not (set(raw_df.columns) & required_any_time):
+        raise ValueError("Missing required time columns in the uploaded file.")
+    if not (set(raw_df.columns) & required_any_employee):
+        raise ValueError("Missing required employee columns in the uploaded file.")
+
+def _validate_processed_frames(
+    raw_df: pd.DataFrame,
+    daily_df: pd.DataFrame,
+    emp_metrics_df: pd.DataFrame,
+    weekly_overtime_df: pd.DataFrame,
+    monthly_overtime_df: pd.DataFrame
+) -> None:
+    """
+    Validate processed outputs before serving from cache/resource.
+    """
+    if raw_df is None or daily_df is None:
+        raise ValueError("Processed data is missing required tables.")
+    if daily_df.empty:
+        raise ValueError("No valid attendance data found in the provided file for weekdays.")
+
+    required_daily_cols = {
+        'Employee Number', 'Employee Full Name', 'Date',
+        'Working Hours', 'Meal Hours', 'Is Late',
+        'Is Early Departure', 'Has Anomaly'
+    }
+    if not required_daily_cols.issubset(set(daily_df.columns)):
+        raise ValueError("Processed daily data is missing required columns.")
+
+    if emp_metrics_df is None or weekly_overtime_df is None or monthly_overtime_df is None:
+        raise ValueError("Processed aggregate tables are incomplete.")
+
+@st.cache_resource(show_spinner=False)
+def load_and_process_data(
+    data_source_path: str,
+    source_signature: str,
+    cache_version: str
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Complete data processing pipeline
     Returns: (raw_df, daily_df, employee_metrics_df, weekly_overtime_df, monthly_overtime_df)
     """
-    try:
-        # Load data
-        raw_df = pd.read_excel(uploaded_file)
-        
-        # Phase 1: Data Cleaning
-        cleaner = DataCleaner()
-        raw_df = cleaner.standardize_names(raw_df)
-        raw_df = cleaner.fill_missing_departments(raw_df)
-        raw_df = cleaner.clean_datetime_columns(raw_df)
-        raw_df = cleaner.detect_duplicates(raw_df)
-        raw_df = cleaner.create_data_quality_flags(raw_df)
-        raw_df = cleaner.clean_system_metadata(raw_df)
-        
-        # Phase 2: Feature Engineering
-        engineer = FeatureEngineer()
-        daily_df = engineer.calculate_daily_attendance(raw_df)
-        if daily_df.empty:
-            st.warning("No valid attendance data found in the provided file for weekdays.")
-            return None, None, None, None, None
+    if not data_source_path or not os.path.exists(data_source_path):
+        raise FileNotFoundError("Attendance data file not found.")
 
-        daily_df = engineer.add_compliance_metrics(daily_df)
-        daily_df = engineer.detect_anomalies(daily_df)
-        
-        # Employee-level metrics
-        emp_metrics_df = engineer.calculate_productivity_metrics(daily_df)
+    # Load data
+    raw_df = _read_excel_file(data_source_path)
+    _validate_raw_df(raw_df)
+    
+    # Phase 1: Data Cleaning
+    cleaner = DataCleaner()
+    raw_df = cleaner.standardize_names(raw_df)
+    raw_df = cleaner.fill_missing_departments(raw_df)
+    raw_df = cleaner.clean_datetime_columns(raw_df)
+    raw_df = cleaner.detect_duplicates(raw_df)
+    raw_df = cleaner.create_data_quality_flags(raw_df)
+    raw_df = cleaner.clean_system_metadata(raw_df)
+    
+    # Phase 2: Feature Engineering
+    engineer = FeatureEngineer()
+    daily_df = engineer.calculate_daily_attendance(raw_df)
+    if daily_df.empty:
+        raise ValueError("No valid attendance data found in the provided file for weekdays.")
 
-        # Overtime metrics
-        weekly_overtime_df, monthly_overtime_df = engineer.calculate_overtime_metrics(daily_df)
-        
-        return raw_df, daily_df, emp_metrics_df, weekly_overtime_df, monthly_overtime_df
-        
-    except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
-        return None, None, None, None, None
+    daily_df = engineer.add_compliance_metrics(daily_df)
+    daily_df = engineer.detect_anomalies(daily_df)
+    
+    # Employee-level metrics
+    emp_metrics_df = engineer.calculate_productivity_metrics(daily_df)
+
+    # Overtime metrics
+    weekly_overtime_df, monthly_overtime_df = engineer.calculate_overtime_metrics(daily_df)
+
+    _validate_processed_frames(
+        raw_df,
+        daily_df,
+        emp_metrics_df,
+        weekly_overtime_df,
+        monthly_overtime_df
+    )
+    
+    return raw_df, daily_df, emp_metrics_df, weekly_overtime_df, monthly_overtime_df
 
 # ============================================================================
 # CACHED AGGREGATIONS (PERFORMANCE)
 # ============================================================================
 
-@st.cache_data(show_spinner=False)
 def get_productivity_metrics(daily_df: pd.DataFrame) -> pd.DataFrame:
     return FeatureEngineer.calculate_productivity_metrics(daily_df)
 
-@st.cache_data(show_spinner=False)
 def get_dow_summary(view_df: pd.DataFrame) -> pd.Series:
     return view_df.groupby('Day of Week')['Working Hours'].mean().reindex([
         'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'
     ])
 
-@st.cache_data(show_spinner=False)
 def get_monthly_metrics_cached(daily_df: pd.DataFrame) -> pd.DataFrame:
     return calculate_monthly_metrics(daily_df)
 
-@st.cache_data(show_spinner=False)
 def get_recent_changes(monthly_df: pd.DataFrame) -> pd.DataFrame:
     monthly_df_sorted = monthly_df.sort_values(['Employee Full Name', 'YearMonth'])
     monthly_df_sorted['Prev Total Hours'] = monthly_df_sorted.groupby('Employee Full Name')['Total Hours'].shift(1)
@@ -1175,29 +1359,33 @@ def get_recent_changes(monthly_df: pd.DataFrame) -> pd.DataFrame:
     recent_changes = recent_changes[recent_changes['Prev Total Hours'].notna()].sort_values('Hours Change', ascending=False)
     return recent_changes
 
-@st.cache_data(show_spinner=False)
 def get_work_pattern_kpis_cached(
     daily_df: pd.DataFrame, employee_name: str, year: int, month: int
 ) -> Dict[str, float]:
     return calculate_work_pattern_kpis(daily_df, employee_name, year, month)
 
-@st.cache_data(show_spinner=False)
 def get_work_pattern_distribution_cached(
     daily_df: pd.DataFrame, employee_name: str, year: int, month: int
 ) -> pd.DataFrame:
     return calculate_work_pattern_distribution(daily_df, employee_name, year, month)
 
-@st.cache_data(show_spinner=False)
 def get_work_pattern_calendar_cached(
     daily_df: pd.DataFrame,
     employee_name: str,
     year: int,
     month: int,
-    kpi_data: Optional[Dict[str, float]] = None
+    kpi_data: Optional[Dict[str, float]] = None,
+    special_day_items: Optional[Tuple[Tuple[str, str, str], ...]] = None
 ) -> str:
-    return create_work_pattern_calendar(daily_df, employee_name, year, month, kpi_data)
+    return create_work_pattern_calendar(
+        daily_df,
+        employee_name,
+        year,
+        month,
+        kpi_data,
+        special_day_items
+    )
 
-@st.cache_data(show_spinner=False)
 def get_weekly_employee_comparison_cached(
     daily_df: pd.DataFrame,
     year: int,
@@ -1209,7 +1397,6 @@ def get_weekly_employee_comparison_cached(
     weekdays = list(weekday_tuple) if weekday_tuple else None
     return calculate_weekly_employee_comparison(daily_df, year, month, employees, weekdays)
 
-@st.cache_data(show_spinner=False)
 def get_lunch_break_risk_cached(
     daily_df: pd.DataFrame,
     year: int,
@@ -2621,7 +2808,8 @@ def create_work_pattern_calendar(
     employee_name: str,
     year: int,
     month: int,
-    kpi_data: Optional[Dict[str, float]] = None
+    kpi_data: Optional[Dict[str, float]] = None,
+    special_day_items: Optional[Tuple[Tuple[str, str, str], ...]] = None
 ):
     """
     Create a calendar view for employee attendance with employee-specific work patterns.
@@ -2647,6 +2835,18 @@ def create_work_pattern_calendar(
 
     if kpi_data is None:
         kpi_data = calculate_work_pattern_kpis(daily_df, employee_name, year, month)
+
+    special_day_map: Dict[date, Dict[str, str]] = {}
+    if special_day_items:
+        for date_str, day_type, reason in special_day_items:
+            try:
+                day_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            except (TypeError, ValueError):
+                continue
+            special_day_map[day_date] = {
+                'type': str(day_type or 'Special Day'),
+                'reason': str(reason or '').strip()
+            }
 
     expected_days = int(kpi_data.get('expected_days', 0) or 0)
     actual_days = int(kpi_data.get('actual_days', 0) or 0)
@@ -2758,8 +2958,11 @@ def create_work_pattern_calendar(
         .badge-anom{border-color:#6c4ab6;color:#3d2a6d;}
         .badge-holiday{border-color:#2E86AB;background:#e8f1ff;color:#1f5f7a;}
         .ot-pill{font-size:9px;font-weight:700;padding:2px 6px;border-radius:6px;background:#edf0f3;border:1px dashed #c7d1dc;color:#2f3a43;}
+        .badge-special{border-color:#1f7a6b;background:#e6f6f4;color:#145b4f;}
         .time-range{font-size:10px;color:#4b5b66;margin-top:4px;min-height:12px;}
         .meal-text{font-size:10px;color:#6b7280;margin-top:2px;min-height:12px;}
+        .meal-text.meal-risk-warning{color:#7a5d00;background:rgba(242,201,76,0.18);border:1px solid rgba(242,201,76,0.35);padding:1px 4px;border-radius:4px;font-weight:600;display:inline-block;}
+        .meal-text.meal-risk-critical{color:#8a1f1f;background:rgba(235,87,87,0.16);border:1px solid rgba(235,87,87,0.35);padding:1px 4px;border-radius:4px;font-weight:700;display:inline-block;}
         .cell-bar{position:absolute;left:8px;right:8px;bottom:8px;}
         .hours-track{margin-top:6px;height:6px;background:#e5ebf1;border-radius:999px;overflow:hidden;}
         .hours-track.placeholder{opacity:0;}
@@ -2824,7 +3027,8 @@ def create_work_pattern_calendar(
         'absent': '#ffe7e7',
         'anomaly': '#f4eeff',
         'holiday': '#e8f1ff',
-        'weekoff': '#edf0f3'
+        'weekoff': '#edf0f3',
+        'special': '#e6f6f4'
     }
     pill_colors = {
         'full': '#2f9e44',
@@ -2833,11 +3037,13 @@ def create_work_pattern_calendar(
         'absent': '#b73b3b',
         'anomaly': '#5a3fa0',
         'holiday': '#2E86AB',
-        'weekoff': '#7a8794'
+        'weekoff': '#7a8794',
+        'special': '#1f7a6b'
     }
     text_colors = {
         'holiday': '#1f5f7a',
-        'weekoff': '#4b5b66'
+        'weekoff': '#4b5b66',
+        'special': '#145b4f'
     }
     
     status_labels = {
@@ -2847,7 +3053,8 @@ def create_work_pattern_calendar(
         'absent': 'Absent',
         'anomaly': 'Anomaly',
         'holiday': 'Holiday',
-        'weekoff': 'Week Off'
+        'weekoff': 'Week Off',
+        'special': 'Special Day'
     }
     
     non_working_border = '#607d8b'
@@ -2870,6 +3077,9 @@ def create_work_pattern_calendar(
 
             day_info = date_status.get(day)
             expected_hours_day = get_expected_daily_hours(weekday, early_departure_override) if is_expected_workday else 0.0
+            special_day = special_day_map.get(current_date.date())
+            special_label = special_day.get('type') if special_day else ''
+            special_reason = special_day.get('reason') if special_day else ''
             
             if day_info is not None:
                 status = 'absent'  # Default
@@ -2891,10 +3101,23 @@ def create_work_pattern_calendar(
                 worked_on_non_working = not is_expected_workday
                 hours = float(day_info.get('Working Hours', 0.0) or 0.0)
                 meal_hours = float(day_info.get('Meal Hours', 0.0) or 0.0)
-                if weekday == 4:
-                    daily_overtime = max(0.0, hours - 4.25)
+                meal_minutes = meal_hours * 60.0
+                meal_risk = None
+                if hours >= Config.MEAL_RISK_LONG_DAY_HOURS:
+                    if meal_minutes <= Config.MEAL_RISK_CRITICAL_MINUTES:
+                        meal_risk = 'critical'
+                    elif meal_minutes < Config.MEAL_RISK_WARNING_MINUTES:
+                        meal_risk = 'warning'
+                if meal_risk == 'critical':
+                    meal_class = 'meal-risk-critical'
+                elif meal_risk == 'warning':
+                    meal_class = 'meal-risk-warning'
                 else:
-                    daily_overtime = max(0.0, hours - 8.5)
+                    meal_class = ''
+                if weekday == 4:
+                    daily_overtime = max(0.0, hours - 5.0)
+                else:
+                    daily_overtime = max(0.0, hours - 8.75)
                 bg_color = colors.get(status, '#ffffff')
                 pill_color = pill_colors.get(status, '#2E86AB')
                 text_color = text_colors.get(status, '#1a1a1a')
@@ -2905,9 +3128,18 @@ def create_work_pattern_calendar(
 
                 # Tooltip info
                 info = f"Status: {shift_type} | Hours: {hours:.1f}h"
+                if special_day:
+                    special_text = f"Special Day: {special_label or 'Special Day'}"
+                    if special_reason:
+                        special_text += f" ({special_reason})"
+                    info = f"{special_text} | {info}"
                 if is_holiday and holiday_name:
                     info = f"Holiday: {holiday_name} | {info}"
                 info += f" | Meal: {meal_hours:.1f}h"
+                if meal_risk == 'critical':
+                    info += " | Meal Risk: Critical (no meal)"
+                elif meal_risk == 'warning':
+                    info += " | Meal Risk: Warning (<30 min)"
                 if expected_hours_day > 0:
                     info += f" | Expected: {expected_hours_day:.1f}h"
                 if worked_on_non_working:
@@ -2952,6 +3184,15 @@ def create_work_pattern_calendar(
                     badges.append('<span class="badge badge-miss" title="Missing Punch Out">M</span>')
                 if day_info.get('Has Anomaly', False):
                     badges.append('<span class="badge badge-anom" title="Anomaly">A</span>')
+                if special_day:
+                    special_badge_text = special_label or 'Special'
+                    special_title = special_badge_text
+                    if special_reason:
+                        special_title += f" - {special_reason}"
+                    special_title = special_title.replace('"', '&quot;')
+                    badges.append(
+                        f'<span class="badge badge-special" title="{special_title}">{special_badge_text}</span>'
+                    )
 
                 in_time = day_info['First Punch In'].strftime('%H:%M') if pd.notna(day_info.get('First Punch In')) else '--'
                 out_time = day_info['Last Punch Out'].strftime('%H:%M') if pd.notna(day_info.get('Last Punch Out')) else '--'
@@ -2985,7 +3226,7 @@ def create_work_pattern_calendar(
                     html += ''.join(badges)
                 html += '</div>'
                 html += f'<div class="time-range">{time_range or "&nbsp;"}</div>'
-                html += f'<div class="meal-text">Meal: {meal_hours:.1f}h</div>'
+                html += f'<div class="meal-text {meal_class}">Meal: {meal_hours:.1f}h</div>'
                 html += '<div class="cell-bar">'
                 if is_expected_workday or hours > 0:
                     html += (
@@ -2998,7 +3239,36 @@ def create_work_pattern_calendar(
                 html += '</div>'
                 html += '</td>'
             else:
-                if is_holiday:
+                if special_day:
+                    bg_color = colors['special']
+                    pill_color = pill_colors['special']
+                    cell_style = (
+                        f"padding: 8px; border: 1px solid #d7dee7; border-radius: 10px; "
+                        f"background-color: {bg_color}; color: {text_colors.get('special', '#1a1a1a')}; min-height: 110px; "
+                        "vertical-align: top; position: relative;"
+                    )
+                    title_text = f"Special Day: {special_label or 'Special Day'}"
+                    if special_reason:
+                        title_text += f" | {special_reason}"
+                    if is_holiday and holiday_name:
+                        title_text = f"Holiday: {holiday_name} | {title_text}"
+                    html += f'<td class="cal-cell" style="{cell_style}" title="{title_text}">'
+                    html += '<div class="cell-body">'
+                    html += '<div class="day-top">'
+                    html += f'<div class="day-num">{day}</div>'
+                    html += f'<span class="status-pill" style="background-color: {pill_color};">{status_labels["special"]}</span>'
+                    html += '</div>'
+                    html += '<div class="badge-row">'
+                    html += '<span class="hours-pill">0.0h</span>'
+                    html += f'<span class="badge badge-special">{special_label or "Special"}</span>'
+                    html += '</div>'
+                    html += '<div class="time-range">&nbsp;</div>'
+                    html += '<div class="cell-bar">'
+                    html += '<div class="hours-track placeholder"><span class="hours-fill zero" style="width: 0%;"></span></div>'
+                    html += '</div>'
+                    html += '</div>'
+                    html += '</td>'
+                elif is_holiday:
                     # Holiday (no punches)
                     bg_color = colors['holiday']
                     pill_color = pill_colors['holiday']
@@ -3081,6 +3351,7 @@ def create_work_pattern_calendar(
     html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["short"]};border-color:#f6caa1;"></span> Short Day</div>'
     html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["absent"]};border-color:#f1b5b5;"></span> Absent</div>'
     html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["holiday"]};border-color:#c6d7f2;"></span> Holiday</div>'
+    html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["special"]};border-color:#b7e0d8;"></span> Special Day</div>'
     html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["anomaly"]};border-color:#cbb6f5;"></span> Anomaly</div>'
     html += f'<div class="legend-item"><span class="legend-swatch" style="background:{colors["weekoff"]};border-color:#dbe1e8;"></span> Week Off</div>'
     html += '</div>'
@@ -3091,6 +3362,7 @@ def create_work_pattern_calendar(
     html += '<div class="legend-item"><span class="badge badge-early">E</span> Early Departure</div>'
     html += '<div class="legend-item"><span class="badge badge-miss">M</span> Missing Punch Out</div>'
     html += '<div class="legend-item"><span class="badge badge-anom">A</span> Anomaly Flag</div>'
+    html += '<div class="legend-item"><span class="badge badge-special">Special</span> Operational Note</div>'
     html += f'<div class="legend-item"><span class="legend-swatch" style="border:2px solid {non_working_border};background:#fff;"></span> Worked on Off-Day</div>'
     html += '<div class="legend-item"><span class="legend-bar"></span> Hours vs Expected</div>'
     html += '</div>'
@@ -3111,6 +3383,9 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded"
     )
+
+    _ensure_cache_version()
+
     
     # Custom CSS - Professional HR Dashboard Styling
     st.markdown("""
@@ -3190,7 +3465,7 @@ def main():
             merge_ok = DataManager.merge_and_save(uploaded_file, Config.DATA_FILE_PATH)
         if merge_ok:
             st.sidebar.success("\u2705 Data updated successfully!")
-            st.cache_data.clear()
+            _clear_all_caches()
             data_source = Config.DATA_FILE_PATH
         else:
             st.stop()
@@ -3202,13 +3477,56 @@ def main():
         st.info("Welcome! Please upload an Excel file in the sidebar to initialize the dashboard.")
         st.stop()
     
-    # Load data
-    with st.spinner("Loading and processing attendance data..."):
-        raw_df, daily_df, emp_metrics_df, weekly_overtime_df, monthly_overtime_df = load_and_process_data(data_source)
-
-    if daily_df is None:
-        # Error is already displayed in the load function
-        st.stop()
+    # Load data (cache-aware, defensive against corrupted cache payloads)
+    source_signature = _get_data_source_signature(data_source)
+    try:
+        with st.spinner("Loading and processing attendance data..."):
+            raw_df, daily_df, emp_metrics_df, weekly_overtime_df, monthly_overtime_df = load_and_process_data(
+                data_source,
+                source_signature,
+                Config.CACHE_VERSION
+            )
+        _validate_processed_frames(
+            raw_df,
+            daily_df,
+            emp_metrics_df,
+            weekly_overtime_df,
+            monthly_overtime_df
+        )
+    except Exception as e:
+        message = str(e)
+        if _is_cache_corruption_error(message):
+            _clear_all_caches()
+            backup_restored = _restore_data_file_from_backup(data_source)
+            if backup_restored:
+                source_signature = _get_data_source_signature(data_source)
+            try:
+                with st.spinner("Rebuilding cached data..."):
+                    raw_df, daily_df, emp_metrics_df, weekly_overtime_df, monthly_overtime_df = load_and_process_data(
+                        data_source,
+                        source_signature,
+                        Config.CACHE_VERSION
+                    )
+                _validate_processed_frames(
+                    raw_df,
+                    daily_df,
+                    emp_metrics_df,
+                    weekly_overtime_df,
+                    monthly_overtime_df
+                )
+            except Exception as retry_error:
+                retry_text = str(retry_error)
+                if _is_cache_corruption_error(retry_text):
+                    st.error(
+                        "Error loading data: Data file appears corrupted. "
+                        "Please upload a fresh Excel file from the Data Management panel."
+                    )
+                else:
+                    st.error(f"Error loading data: {retry_text}")
+                st.stop()
+        else:
+            st.error(f"Error loading data: {message}")
+            st.stop()
     
     # ========================================================================
     # SIDEBAR CONTROLS
@@ -3244,10 +3562,10 @@ def main():
         st.sidebar.error("Start Date must be on or before End Date.")
         daily_filtered = daily_df.copy()
     else:
-        daily_filtered = daily_df[
+        daily_filtered = daily_df.loc[
             (daily_df['Date'].dt.date >= start_date) &
             (daily_df['Date'].dt.date <= end_date)
-        ]
+        ].copy()
     
     # Department filter (multi-select)
     selected_depts = []
@@ -3256,14 +3574,14 @@ def main():
         selected_depts = st.sidebar.multiselect("Select Department", dept_options)
         
         if selected_depts:
-            daily_filtered = daily_filtered[daily_filtered['Department'].isin(selected_depts)]
+            daily_filtered = daily_filtered[daily_filtered['Department'].isin(selected_depts)].copy()
     
     # Employee filter (multi-select)
     employee_options = sorted(daily_filtered['Employee Full Name'].unique().tolist())
     selected_employees = st.sidebar.multiselect("Select Employee", employee_options)
     
     if selected_employees:
-        daily_filtered = daily_filtered[daily_filtered['Employee Full Name'].isin(selected_employees)]
+        daily_filtered = daily_filtered[daily_filtered['Employee Full Name'].isin(selected_employees)].copy()
     st.sidebar.markdown("---")
     st.sidebar.subheader("\U0001F4CA View Options")
     
@@ -4186,6 +4504,32 @@ def main():
                     st.session_state.wp_cal_month = min_date.month if selected_year_wp == min_date.year else 1
                 selected_month_wp = st.session_state.wp_cal_month
 
+                min_month_date = date(min_date.year, min_date.month, 1)
+                max_month_date = date(max_date.year, max_date.month, 1)
+
+                def _wp_cal_prev():
+                    current = date(st.session_state.wp_cal_year, st.session_state.wp_cal_month, 1)
+                    if current <= min_month_date:
+                        return
+                    if st.session_state.wp_cal_month == 1:
+                        st.session_state.wp_cal_month = 12
+                        st.session_state.wp_cal_year -= 1
+                    else:
+                        st.session_state.wp_cal_month -= 1
+
+                def _wp_cal_next():
+                    current = date(st.session_state.wp_cal_year, st.session_state.wp_cal_month, 1)
+                    if current >= max_month_date:
+                        return
+                    if st.session_state.wp_cal_month == 12:
+                        st.session_state.wp_cal_month = 1
+                        st.session_state.wp_cal_year += 1
+                    else:
+                        st.session_state.wp_cal_month += 1
+
+                selected_year_wp = st.session_state.wp_cal_year
+                selected_month_wp = st.session_state.wp_cal_month
+
                 kpi_data = get_work_pattern_kpis_cached(
                     wp_source_df, selected_emp_wp, selected_year_wp, selected_month_wp
                 )
@@ -4272,17 +4616,116 @@ def main():
                         unsafe_allow_html=True
                     )
 
-                # Generate calendar
-                calendar_html = get_work_pattern_calendar_cached(
-                    wp_source_df,
-                    selected_emp_wp,
-                    selected_year_wp,
-                    selected_month_wp,
-                    kpi_data
-                )
-                
-                # Use Streamlit's HTML component for proper rendering (not markdown)
-                components.html(calendar_html, height=900, scrolling=False)
+                if "special_days" not in st.session_state:
+                    st.session_state.special_days = {}
+
+                special_days = st.session_state.special_days
+
+                with st.expander("Special Day Annotations", expanded=False):
+                    add_col, list_col = st.columns([3, 2])
+                    with add_col:
+                        min_special_date = min_date.date()
+                        max_special_date = max_date.date()
+                        default_special_date = date(selected_year_wp, selected_month_wp, 1)
+                        if default_special_date < min_special_date:
+                            default_special_date = min_special_date
+                        if default_special_date > max_special_date:
+                            default_special_date = max_special_date
+                        if "wp_special_date" in st.session_state:
+                            current_special_date = st.session_state.wp_special_date
+                            if current_special_date < min_special_date or current_special_date > max_special_date:
+                                st.session_state.wp_special_date = default_special_date
+                        else:
+                            st.session_state.wp_special_date = default_special_date
+                        special_date = st.date_input(
+                            "Select Date",
+                            value=st.session_state.wp_special_date,
+                            min_value=min_special_date,
+                            max_value=max_special_date,
+                            key="wp_special_date"
+                        )
+                        special_type = st.selectbox(
+                            "Operational Note",
+                            ["Closed", "Open Late", "Early Close", "Special Hours"],
+                            key="wp_special_type"
+                        )
+                        special_reason = st.text_input(
+                            "Reason (optional)",
+                            key="wp_special_reason",
+                            placeholder="e.g., Weather closure, Staff meeting"
+                        )
+                        if st.button("Save Special Day", key="wp_special_save"):
+                            date_key = special_date.strftime("%Y-%m-%d")
+                            special_days[date_key] = {
+                                "type": special_type,
+                                "reason": special_reason.strip()
+                            }
+                            st.session_state.special_days = special_days
+                    with list_col:
+                        month_items = []
+                        for date_key, meta in special_days.items():
+                            try:
+                                dval = datetime.strptime(date_key, "%Y-%m-%d").date()
+                            except (TypeError, ValueError):
+                                continue
+                            if dval.year == selected_year_wp and dval.month == selected_month_wp:
+                                month_items.append({
+                                    "Date": dval,
+                                    "Type": meta.get("type", ""),
+                                    "Reason": meta.get("reason", "")
+                                })
+                        month_items = sorted(month_items, key=lambda r: r["Date"])
+                        if month_items:
+                            month_df = pd.DataFrame(month_items)
+                            st.dataframe(month_df, use_container_width=True)
+                            remove_options = [row["Date"] for row in month_items]
+                            remove_date = st.selectbox(
+                                "Remove Date",
+                                remove_options,
+                                format_func=lambda d: d.strftime("%b %d, %Y"),
+                                key="wp_special_remove_date"
+                            )
+                            if st.button("Remove", key="wp_special_remove_btn"):
+                                remove_key = remove_date.strftime("%Y-%m-%d")
+                                special_days.pop(remove_key, None)
+                                st.session_state.special_days = special_days
+                        else:
+                            st.caption("No special days noted for this month.")
+
+                special_day_items = []
+                for date_key, meta in special_days.items():
+                    try:
+                        dval = datetime.strptime(date_key, "%Y-%m-%d").date()
+                    except (TypeError, ValueError):
+                        continue
+                    if dval.year == selected_year_wp and dval.month == selected_month_wp:
+                        special_day_items.append(
+                            (date_key, meta.get("type", ""), meta.get("reason", ""))
+                        )
+                special_day_items = tuple(sorted(special_day_items))
+
+                current_month_date = date(selected_year_wp, selected_month_wp, 1)
+                prev_disabled = current_month_date <= min_month_date
+                next_disabled = current_month_date >= max_month_date
+
+                nav_cols = st.columns([1, 16, 1])
+                with nav_cols[0]:
+                    st.button("◀", key="wp_cal_prev", help="Previous month", on_click=_wp_cal_prev, disabled=prev_disabled)
+                with nav_cols[2]:
+                    st.button("▶", key="wp_cal_next", help="Next month", on_click=_wp_cal_next, disabled=next_disabled)
+                with nav_cols[1]:
+                    # Generate calendar
+                    calendar_html = get_work_pattern_calendar_cached(
+                        wp_source_df,
+                        selected_emp_wp,
+                        selected_year_wp,
+                        selected_month_wp,
+                        kpi_data,
+                        special_day_items
+                    )
+                    
+                    # Use Streamlit's HTML component for proper rendering (not markdown)
+                    components.html(calendar_html, height=900, scrolling=False)
                 
                 st.markdown("---")
                 st.markdown("### Work Pattern Distribution")
@@ -4324,7 +4767,7 @@ def main():
                     st.plotly_chart(fig, use_container_width=True)
                     st.caption("Distribution of attendance types for the selected month (based on work patterns)")
                 
-                st.info("Legend is embedded in the calendar. OFF tags mark off-day work; L/E/M/A badges highlight timing and punch issues.")
+                st.info("Legend is embedded in the calendar. OFF tags mark off-day work; L/E/M/A badges highlight timing and punch issues; Special tags and meal dots flag operational notes and meal-risk days.")
             else:
                 st.warning(f"No attendance data found for {selected_emp_wp}")
     
