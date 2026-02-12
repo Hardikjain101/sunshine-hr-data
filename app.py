@@ -16,17 +16,18 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+import hashlib
+import json
 from datetime import datetime, time, timedelta, date
 from typing import Tuple, Dict, List, Optional
 import calendar
 import warnings
 import os
-import shutil
 from functools import lru_cache
-from snowflake_db import (
-    SnowflakeAttendanceRepository,
-    get_required_snowflake_env_vars,
-)
+try:
+    from snowflake.snowpark.context import get_active_session
+except Exception:  # pragma: no cover - allows local lint/parse without Snowpark runtime
+    get_active_session = None
 warnings.filterwarnings('ignore')
 
 # ============================================================================
@@ -36,12 +37,9 @@ warnings.filterwarnings('ignore')
 class Config:
     """Centralized configuration for business rules and thresholds"""
     
-    # Persistent Storage
-    DATA_FILE_PATH = "attendance_data.xlsx"
+    # Snowflake Native persistence
+    SNOWFLAKE_RAW_TABLE = "ATTENDANCE_RAW"
     CACHE_VERSION = "2026-02-07"
-    # Snowflake-specific: AUTO uses Snowflake when env + connector are available, else local file.
-    DATA_BACKEND = os.getenv("DATA_BACKEND", "AUTO").strip().upper()
-    SNOWFLAKE_TABLE = os.getenv("SNOWFLAKE_TABLE", "ATTENDANCE_RAW").strip() or "ATTENDANCE_RAW"
     
     # Department Auto-Mapping
     DEPARTMENT_MAPPING = {
@@ -1039,261 +1037,227 @@ def plot_overtime_charts(overtime_df: pd.DataFrame, time_period: str, top_n: int
 # PHASE 3: DATA PERSISTENCE
 # ============================================================================
 
-SNOWFLAKE_SOURCE_TOKEN = "__SNOWFLAKE__"
+SNOWFLAKE_SOURCE_TOKEN = "__SNOWFLAKE_NATIVE__"
 
-@lru_cache(maxsize=1)
-def _get_snowflake_repository() -> SnowflakeAttendanceRepository:
-    """Lazily construct the Snowflake repository from environment configuration."""
-    return SnowflakeAttendanceRepository(table_name=Config.SNOWFLAKE_TABLE)
-
-def _resolve_data_backend() -> str:
+def _normalize_identifier(identifier: str) -> str:
     """
-    Resolve active data backend.
-    - LOCAL: force filesystem Excel mode
-    - SNOWFLAKE: force Snowflake mode (must be fully configured)
-    - AUTO: use Snowflake when available, otherwise local file mode
+    Snowflake stores unquoted identifiers in uppercase.
+    Keep table names normalized for predictable behavior in native runtime.
     """
-    configured_backend = (Config.DATA_BACKEND or "AUTO").strip().upper()
-    repository = _get_snowflake_repository()
+    token = str(identifier or "").strip()
+    if not token:
+        raise ValueError("Snowflake identifier cannot be empty.")
+    return token.upper()
 
-    if configured_backend == "LOCAL":
-        return "LOCAL"
-
-    if configured_backend == "SNOWFLAKE":
-        repository.assert_ready()
-        return "SNOWFLAKE"
-
-    if configured_backend == "AUTO":
-        return "SNOWFLAKE" if repository.is_enabled() else "LOCAL"
-
-    return "LOCAL"
-
-def _is_snowflake_backend() -> bool:
-    return _resolve_data_backend() == "SNOWFLAKE"
+@st.cache_resource(show_spinner=False)
+def _get_snowflake_session():
+    """Snowflake Native Streamlit session accessor."""
+    if get_active_session is None:
+        raise RuntimeError(
+            "Snowpark session is unavailable. Run this app inside Streamlit in Snowflake."
+        )
+    return get_active_session()
 
 class DataManager:
-    """Handles data persistence and file management"""
+    """Handles Snowflake Native data persistence."""
 
     @staticmethod
-    def _get_excel_extension(name_or_path: str) -> str:
-        return os.path.splitext(str(name_or_path or ""))[1].lower()
+    def _target_table_name() -> str:
+        return _normalize_identifier(Config.SNOWFLAKE_RAW_TABLE)
 
     @staticmethod
-    def _get_excel_engine(ext: str) -> Optional[str]:
-        if ext == ".xlsx":
-            return "openpyxl"
-        if ext == ".xls":
-            return "xlrd"
-        return None
+    def _ensure_table_exists() -> None:
+        session = _get_snowflake_session()
+        table_name = DataManager._target_table_name()
+        ddl = (
+            f"CREATE TABLE IF NOT EXISTS {table_name} ("
+            "ROW_HASH STRING NOT NULL, "
+            "ROW_DATA VARIANT NOT NULL, "
+            "SOURCE_FILE STRING, "
+            "INGESTED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(), "
+            "UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(), "
+            "PRIMARY KEY (ROW_HASH)"
+            ")"
+        )
+        session.sql(ddl).collect()
 
     @staticmethod
-    def _read_uploaded_excel(uploaded_file) -> Optional[pd.DataFrame]:
-        """Read uploaded attendance workbook with engine fallback."""
+    def _read_uploaded_dataset(uploaded_file) -> Optional[pd.DataFrame]:
+        """Read uploaded attendance file from memory (no local filesystem use)."""
         uploaded_file.seek(0)
-        upload_ext = DataManager._get_excel_extension(getattr(uploaded_file, "name", ""))
-        if upload_ext not in [".xlsx", ".xls"]:
-            st.error("Unsupported file type. Please upload a .xlsx or .xls file.")
+        file_name = str(getattr(uploaded_file, "name", "")).strip().lower()
+        if not file_name:
+            st.error("Uploaded file is missing a filename.")
             return None
 
-        upload_engine = DataManager._get_excel_engine(upload_ext)
-        try:
-            return pd.read_excel(uploaded_file, engine=upload_engine)
-        except Exception:
-            uploaded_file.seek(0)
+        if file_name.endswith(".csv"):
+            try:
+                return pd.read_csv(uploaded_file)
+            except Exception:
+                st.error("Error reading uploaded CSV file.")
+                return None
+
+        if file_name.endswith(".xlsx") or file_name.endswith(".xls"):
             try:
                 return pd.read_excel(uploaded_file)
             except Exception:
-                st.error("Error reading the uploaded Excel file. Please verify it is a valid .xlsx or .xls.")
+                st.error(
+                    "Error reading uploaded Excel file. In Snowflake Native runtime, "
+                    "verify required Excel parser support or upload CSV."
+                )
                 return None
-    
+
+        st.error("Unsupported file type. Please upload CSV, XLSX, or XLS.")
+        return None
+
     @staticmethod
-    def merge_and_save(uploaded_file, target_path: str):
+    def _normalize_value(value):
+        if value is None:
+            return None
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+        if isinstance(value, pd.Timestamp):
+            return value.isoformat()
+        if isinstance(value, (datetime, date)):
+            return value.isoformat()
+        if hasattr(value, "item"):
+            try:
+                return value.item()
+            except Exception:
+                return value
+        return value
+
+    @staticmethod
+    def _build_payload_rows(df: pd.DataFrame, source_file: str) -> pd.DataFrame:
+        rows: List[Dict[str, str]] = []
+        for _, row in df.iterrows():
+            payload = {str(col): DataManager._normalize_value(value) for col, value in row.items()}
+            payload_json = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+            row_hash = hashlib.md5(payload_json.encode("utf-8")).hexdigest()
+            rows.append(
+                {
+                    "ROW_HASH": row_hash,
+                    "ROW_DATA_JSON": payload_json,
+                    "SOURCE_FILE": source_file,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def merge_and_save(uploaded_file, target_path: str = ""):
         """
-        Merge uploaded data with existing data and save to the active backend.
+        Snowflake-native merge path:
+        upload payload -> temporary table -> MERGE into canonical raw table.
         """
         try:
-            new_df = DataManager._read_uploaded_excel(uploaded_file)
+            new_df = DataManager._read_uploaded_dataset(uploaded_file)
             if new_df is None:
                 return False
 
-            # Snowflake-specific write path: MERGE into configured table by row hash.
-            if _is_snowflake_backend():
-                repository = _get_snowflake_repository()
-                source_file = getattr(uploaded_file, "name", "uploaded_file")
-                repository.upsert_dataframe(new_df, source_file=source_file)
+            DataManager._ensure_table_exists()
+            session = _get_snowflake_session()
+            target_table = DataManager._target_table_name()
+            source_file = str(getattr(uploaded_file, "name", "uploaded_file"))
+            payload_df = DataManager._build_payload_rows(new_df, source_file=source_file)
+            if payload_df.empty:
                 return True
 
-            # Local filesystem write path.
-            # Check if target file exists
-            if os.path.exists(target_path):
-                try:
-                    target_ext = DataManager._get_excel_extension(target_path)
-                    target_engine = DataManager._get_excel_engine(target_ext)
-                    existing_df = pd.read_excel(target_path, engine=target_engine)
-                    # Combine datasets
-                    combined_df = pd.concat([existing_df, new_df], ignore_index=True, sort=False)
-                    # Remove exact duplicates
-                    combined_df = combined_df.drop_duplicates()
-                except Exception:
-                    combined_df = new_df
-            else:
-                combined_df = new_df
-            
-            # Save merged data
-            base_path, target_ext = os.path.splitext(target_path)
-            if target_ext.lower() not in [".xlsx", ".xls"]:
-                st.error("Data file path must be .xlsx or .xls.")
-                return False
-            temp_path = f"{base_path}.tmp{target_ext}"
-            target_engine = DataManager._get_excel_engine(target_ext.lower())
-            with pd.ExcelWriter(temp_path, engine=target_engine) as writer:
-                combined_df.to_excel(writer, index=False)
-            # Validate temp output before replacing production file
-            _read_excel_file(temp_path, sample_only=True)
+            temp_table = f"{target_table}_UPLOAD_TMP"
+            session.create_dataframe(payload_df).write.mode("overwrite").save_as_table(
+                temp_table,
+                table_type="temporary",
+            )
 
-            backup_path = _get_backup_path(target_path)
-            if os.path.exists(target_path):
-                try:
-                    shutil.copy2(target_path, backup_path)
-                except Exception:
-                    pass
-            os.replace(temp_path, target_path)
-            # Validate final file and roll back if write became corrupted
-            _read_excel_file(target_path, sample_only=True)
+            merge_sql = (
+                f"MERGE INTO {target_table} AS T "
+                f"USING (SELECT ROW_HASH, PARSE_JSON(ROW_DATA_JSON) AS ROW_DATA, SOURCE_FILE FROM {temp_table}) AS S "
+                "ON T.ROW_HASH = S.ROW_HASH "
+                "WHEN MATCHED THEN UPDATE SET "
+                "ROW_DATA = S.ROW_DATA, SOURCE_FILE = S.SOURCE_FILE, UPDATED_AT = CURRENT_TIMESTAMP() "
+                "WHEN NOT MATCHED THEN INSERT "
+                "(ROW_HASH, ROW_DATA, SOURCE_FILE, INGESTED_AT, UPDATED_AT) "
+                "VALUES (S.ROW_HASH, S.ROW_DATA, S.SOURCE_FILE, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())"
+            )
+            session.sql(merge_sql).collect()
             return True
-            
         except Exception as e:
-            try:
-                if 'temp_path' in locals() and os.path.exists(temp_path):
-                    os.remove(temp_path)
-            except Exception:
-                pass
-            try:
-                if 'backup_path' in locals() and os.path.exists(backup_path):
-                    shutil.copy2(backup_path, target_path)
-            except Exception:
-                pass
             st.error(f"Error saving data: {str(e)}")
             return False
 
     @staticmethod
-    def source_has_data(target_path: str) -> bool:
-        """Check whether the active backend currently has readable data."""
-        if _is_snowflake_backend():
-            repository = _get_snowflake_repository()
-            return repository.has_data()
-        return os.path.exists(target_path)
+    def source_has_data(target_path: str = "") -> bool:
+        DataManager._ensure_table_exists()
+        table_name = DataManager._target_table_name()
+        session = _get_snowflake_session()
+        count_df = session.sql(f"SELECT COUNT(*) AS ROW_COUNT FROM {table_name}").to_pandas()
+        if count_df.empty:
+            return False
+        return int(count_df.iloc[0]["ROW_COUNT"]) > 0
 
     @staticmethod
-    def get_source_token(target_path: str) -> str:
+    def load_raw_attendance_df() -> pd.DataFrame:
+        DataManager._ensure_table_exists()
+        table_name = DataManager._target_table_name()
+        session = _get_snowflake_session()
+        raw_payload_df = session.sql(
+            f"SELECT TO_JSON(ROW_DATA) AS ROW_DATA_JSON FROM {table_name} ORDER BY INGESTED_AT"
+        ).to_pandas()
+        records: List[Dict[str, object]] = []
+        for payload in raw_payload_df.get("ROW_DATA_JSON", pd.Series(dtype=object)):
+            if payload is None:
+                continue
+            try:
+                payload_dict = json.loads(payload)
+            except Exception:
+                continue
+            if isinstance(payload_dict, dict):
+                records.append(payload_dict)
+        return pd.DataFrame(records)
+
+    @staticmethod
+    def get_source_token(target_path: str = "") -> str:
         """Return logical source token used by cached loaders."""
-        if _is_snowflake_backend():
-            return SNOWFLAKE_SOURCE_TOKEN
-        return target_path
+        return SNOWFLAKE_SOURCE_TOKEN
 
 # ============================================================================
 # DATA LOADING & PROCESSING PIPELINE
 # ============================================================================
 
-def _get_backup_path(path: str) -> str:
-    base_path, ext = os.path.splitext(path)
-    return f"{base_path}.bak{ext}"
-
-def _read_excel_file(path: str, sample_only: bool = False) -> pd.DataFrame:
-    """
-    Read an Excel file with extension-aware engine fallback.
-    Raises a clean ValueError for corrupted zip/compression payloads.
-    """
-    ext = DataManager._get_excel_extension(path)
-    engine = DataManager._get_excel_engine(ext)
-    read_kwargs = {"nrows": 5} if sample_only else {}
-    errors: List[Exception] = []
-
-    if engine:
-        try:
-            return pd.read_excel(path, engine=engine, **read_kwargs)
-        except Exception as ex:
-            errors.append(ex)
-
-    try:
-        return pd.read_excel(path, **read_kwargs)
-    except Exception as ex:
-        errors.append(ex)
-
-    error_text = " | ".join(str(err) for err in errors)
-    lowered = error_text.lower()
-    if "error -3" in lowered or "decompressing data" in lowered or "zlib" in lowered:
-        raise ValueError(f"Data file '{os.path.basename(path)}' is corrupted or partially written.")
-    raise ValueError(f"Unable to read Excel file '{os.path.basename(path)}'. {error_text}")
-
-def _restore_data_file_from_backup(target_path: str) -> bool:
-    """
-    Restore the primary data file from its backup if the backup is valid.
-    """
-    if _is_snowflake_backend():
-        # Snowflake-specific: backup restore is a filesystem-only concern.
-        return False
-
-    backup_path = _get_backup_path(target_path)
-    if not os.path.exists(backup_path):
-        return False
-
-    try:
-        _read_excel_file(backup_path, sample_only=True)
-    except Exception:
-        return False
-
-    restore_tmp = f"{target_path}.restore_tmp"
-    try:
-        shutil.copy2(backup_path, restore_tmp)
-        os.replace(restore_tmp, target_path)
-        return True
-    except Exception:
-        try:
-            if os.path.exists(restore_tmp):
-                os.remove(restore_tmp)
-        except Exception:
-            pass
-        return False
-
 def _get_data_source_signature(path: str) -> str:
     """
-    Build a deterministic signature for cache invalidation.
-    Uses file metadata in local mode and Snowflake table state in Snowflake mode.
+    Build a deterministic signature for cache invalidation from Snowflake table state.
     """
-    if _is_snowflake_backend():
-        repository = _get_snowflake_repository()
-        return repository.get_source_signature()
-
-    try:
-        stat = os.stat(path)
-    except OSError:
-        return "missing"
-    return f"{stat.st_mtime_ns}-{stat.st_size}"
+    DataManager._ensure_table_exists()
+    table_name = DataManager._target_table_name()
+    session = _get_snowflake_session()
+    signature_df = session.sql(
+        "SELECT "
+        "COUNT(*) AS ROW_COUNT, "
+        "COALESCE(MAX(UPDATED_AT), MAX(INGESTED_AT)) AS LAST_CHANGE "
+        f"FROM {table_name}"
+    ).to_pandas()
+    if signature_df.empty:
+        return "snowflake-empty"
+    row_count = int(signature_df.iloc[0]["ROW_COUNT"])
+    last_change = signature_df.iloc[0]["LAST_CHANGE"]
+    if row_count == 0:
+        return "snowflake-empty"
+    return f"snowflake-{row_count}-{last_change}"
 
 def _ensure_cache_version() -> None:
     """
-    Clear cached artifacts when the cache schema version changes.
-    Uses a small on-disk version marker to persist across sessions.
+    Clear cached artifacts when cache schema version changes.
+    Snowflake Native-safe: session_state marker instead of local filesystem.
     """
-    version_path = os.path.join(os.path.dirname(__file__), ".cache_version")
-    last_version = None
-    try:
-        if os.path.exists(version_path):
-            with open(version_path, "r", encoding="utf-8") as handle:
-                last_version = handle.read().strip()
-    except OSError:
-        last_version = None
-
+    marker_key = "__cache_version__"
+    last_version = st.session_state.get(marker_key)
     if last_version != Config.CACHE_VERSION:
         st.cache_data.clear()
         st.cache_resource.clear()
-        try:
-            with open(version_path, "w", encoding="utf-8") as handle:
-                handle.write(Config.CACHE_VERSION)
-        except OSError:
-            # If we can't write the version marker, proceed without failing
-            pass
+        st.session_state[marker_key] = Config.CACHE_VERSION
 
 def _clear_all_caches() -> None:
     """Clear both data and resource caches in one place."""
@@ -1359,7 +1323,7 @@ def _validate_processed_frames(
     if emp_metrics_df is None or weekly_overtime_df is None or monthly_overtime_df is None:
         raise ValueError("Processed aggregate tables are incomplete.")
 
-@st.cache_resource(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def load_and_process_data(
     data_source_path: str,
     source_signature: str,
@@ -1369,16 +1333,10 @@ def load_and_process_data(
     Complete data processing pipeline
     Returns: (raw_df, daily_df, employee_metrics_df, weekly_overtime_df, monthly_overtime_df)
     """
-    if _is_snowflake_backend():
-        # Snowflake-specific read path: hydrate source rows from Snowflake table.
-        repository = _get_snowflake_repository()
-        raw_df = repository.fetch_all_rows()
-        if raw_df is None or raw_df.empty:
-            raise FileNotFoundError("Attendance data not found in Snowflake table.")
-    else:
-        if not data_source_path or not os.path.exists(data_source_path):
-            raise FileNotFoundError("Attendance data file not found.")
-        raw_df = _read_excel_file(data_source_path)
+    # Snowflake Native read path: hydrate source rows from Snowflake table.
+    raw_df = DataManager.load_raw_attendance_df()
+    if raw_df is None or raw_df.empty:
+        raise FileNotFoundError("Attendance data not found in Snowflake table.")
 
     _validate_raw_df(raw_df)
     
@@ -1705,9 +1663,9 @@ if os.environ.get("DEBUG_PUNCH_FIX") == "1":
 
         regression_summary = {'sampled': 0, 'changed': 0, 'flagged': 0, 'ratio': 0.0}
         try:
-            if os.path.exists(Config.DATA_FILE_PATH):
+            if DataManager.source_has_data():
                 cleaner = DataCleaner()
-                raw_debug_df = pd.read_excel(Config.DATA_FILE_PATH)
+                raw_debug_df = DataManager.load_raw_attendance_df()
                 raw_debug_df = cleaner.standardize_names(raw_debug_df)
                 raw_debug_df = cleaner.fill_missing_departments(raw_debug_df)
                 raw_debug_df = cleaner.clean_datetime_columns(raw_debug_df)
@@ -3539,49 +3497,30 @@ def main():
     # FILE MANAGEMENT & PERSISTENCE
     st.sidebar.markdown("---")
     st.sidebar.subheader("\U0001F4CA Data Management")
-    try:
-        active_backend = _resolve_data_backend()
-    except Exception as backend_error:
-        st.sidebar.error(f"Data backend configuration error: {backend_error}")
-        required_env = ", ".join(get_required_snowflake_env_vars())
-        st.sidebar.caption(f"Required Snowflake env vars: {required_env}")
-        st.stop()
+    st.sidebar.caption("Active backend: Snowflake Native (Snowpark Session)")
+    st.sidebar.caption(f"Target table: {Config.SNOWFLAKE_RAW_TABLE.upper()}")
 
-    if active_backend == "SNOWFLAKE":
-        # Snowflake-specific UI context for operational clarity.
-        st.sidebar.caption("Active backend: Snowflake")
-        st.sidebar.caption(f"Target table: {Config.SNOWFLAKE_TABLE.upper()}")
-    else:
-        st.sidebar.caption("Active backend: Local Excel file")
+    uploaded_file = st.sidebar.file_uploader("Update Data Source", type=['csv', 'xlsx', 'xls'])
+    data_source = DataManager.get_source_token()
 
-    uploaded_file = st.sidebar.file_uploader("Update Data Source", type=['xlsx', 'xls'])
-    
-    data_source = None
-    
-    # 1. Handle new file upload (Append/Refresh)
+    # 1. Handle new file upload (Append/Refresh) using Snowflake-native persistence.
     if uploaded_file is not None:
         with st.spinner("Merging and updating data..."):
-            merge_ok = DataManager.merge_and_save(uploaded_file, Config.DATA_FILE_PATH)
+            merge_ok = DataManager.merge_and_save(uploaded_file)
         if merge_ok:
             st.sidebar.success("\u2705 Data updated successfully!")
             _clear_all_caches()
-            data_source = DataManager.get_source_token(Config.DATA_FILE_PATH)
         else:
             st.stop()
-    # 2. Check for existing persistent source in active backend
-    else:
-        try:
-            if DataManager.source_has_data(Config.DATA_FILE_PATH):
-                data_source = DataManager.get_source_token(Config.DATA_FILE_PATH)
-        except Exception as source_error:
-            st.error(f"Error checking data source: {source_error}")
-            st.stop()
-    
-    if data_source is None:
-        if active_backend == "SNOWFLAKE":
-            st.info("No attendance data found in Snowflake. Upload an Excel file in the sidebar to initialize the table.")
-        else:
-            st.info("Welcome! Please upload an Excel file in the sidebar to initialize the dashboard.")
+    # 2. Check for existing data in Snowflake.
+    try:
+        has_data = DataManager.source_has_data()
+    except Exception as source_error:
+        st.error(f"Error checking Snowflake source: {source_error}")
+        st.stop()
+
+    if not has_data:
+        st.info("No attendance data found in Snowflake. Upload a source file in the sidebar to initialize the table.")
         st.stop()
     
     # Load data (cache-aware, defensive against corrupted cache payloads)
@@ -3604,11 +3543,7 @@ def main():
         message = str(e)
         if _is_cache_corruption_error(message):
             _clear_all_caches()
-            backup_restored = _restore_data_file_from_backup(data_source) if active_backend == "LOCAL" else False
-            if backup_restored:
-                source_signature = _get_data_source_signature(data_source)
-            elif active_backend == "SNOWFLAKE":
-                source_signature = _get_data_source_signature(data_source)
+            source_signature = _get_data_source_signature(data_source)
             try:
                 with st.spinner("Rebuilding cached data..."):
                     raw_df, daily_df, emp_metrics_df, weekly_overtime_df, monthly_overtime_df = load_and_process_data(
@@ -3626,16 +3561,10 @@ def main():
             except Exception as retry_error:
                 retry_text = str(retry_error)
                 if _is_cache_corruption_error(retry_text):
-                    if active_backend == "SNOWFLAKE":
-                        st.error(
-                            "Error loading data: Cached payload rebuild failed for Snowflake source. "
-                            "Please upload a fresh Excel file from the Data Management panel."
-                        )
-                    else:
-                        st.error(
-                            "Error loading data: Data file appears corrupted. "
-                            "Please upload a fresh Excel file from the Data Management panel."
-                        )
+                    st.error(
+                        "Error loading data: Cached payload rebuild failed for Snowflake source. "
+                        "Please upload a fresh source file from the Data Management panel."
+                    )
                 else:
                     st.error(f"Error loading data: {retry_text}")
                 st.stop()
