@@ -23,6 +23,10 @@ import warnings
 import os
 import shutil
 from functools import lru_cache
+from snowflake_db import (
+    SnowflakeAttendanceRepository,
+    get_required_snowflake_env_vars,
+)
 warnings.filterwarnings('ignore')
 
 # ============================================================================
@@ -35,6 +39,9 @@ class Config:
     # Persistent Storage
     DATA_FILE_PATH = "attendance_data.xlsx"
     CACHE_VERSION = "2026-02-07"
+    # Snowflake-specific: AUTO uses Snowflake when env + connector are available, else local file.
+    DATA_BACKEND = os.getenv("DATA_BACKEND", "AUTO").strip().upper()
+    SNOWFLAKE_TABLE = os.getenv("SNOWFLAKE_TABLE", "ATTENDANCE_RAW").strip() or "ATTENDANCE_RAW"
     
     # Department Auto-Mapping
     DEPARTMENT_MAPPING = {
@@ -1032,6 +1039,38 @@ def plot_overtime_charts(overtime_df: pd.DataFrame, time_period: str, top_n: int
 # PHASE 3: DATA PERSISTENCE
 # ============================================================================
 
+SNOWFLAKE_SOURCE_TOKEN = "__SNOWFLAKE__"
+
+@lru_cache(maxsize=1)
+def _get_snowflake_repository() -> SnowflakeAttendanceRepository:
+    """Lazily construct the Snowflake repository from environment configuration."""
+    return SnowflakeAttendanceRepository(table_name=Config.SNOWFLAKE_TABLE)
+
+def _resolve_data_backend() -> str:
+    """
+    Resolve active data backend.
+    - LOCAL: force filesystem Excel mode
+    - SNOWFLAKE: force Snowflake mode (must be fully configured)
+    - AUTO: use Snowflake when available, otherwise local file mode
+    """
+    configured_backend = (Config.DATA_BACKEND or "AUTO").strip().upper()
+    repository = _get_snowflake_repository()
+
+    if configured_backend == "LOCAL":
+        return "LOCAL"
+
+    if configured_backend == "SNOWFLAKE":
+        repository.assert_ready()
+        return "SNOWFLAKE"
+
+    if configured_backend == "AUTO":
+        return "SNOWFLAKE" if repository.is_enabled() else "LOCAL"
+
+    return "LOCAL"
+
+def _is_snowflake_backend() -> bool:
+    return _resolve_data_backend() == "SNOWFLAKE"
+
 class DataManager:
     """Handles data persistence and file management"""
 
@@ -1046,30 +1085,45 @@ class DataManager:
         if ext == ".xls":
             return "xlrd"
         return None
+
+    @staticmethod
+    def _read_uploaded_excel(uploaded_file) -> Optional[pd.DataFrame]:
+        """Read uploaded attendance workbook with engine fallback."""
+        uploaded_file.seek(0)
+        upload_ext = DataManager._get_excel_extension(getattr(uploaded_file, "name", ""))
+        if upload_ext not in [".xlsx", ".xls"]:
+            st.error("Unsupported file type. Please upload a .xlsx or .xls file.")
+            return None
+
+        upload_engine = DataManager._get_excel_engine(upload_ext)
+        try:
+            return pd.read_excel(uploaded_file, engine=upload_engine)
+        except Exception:
+            uploaded_file.seek(0)
+            try:
+                return pd.read_excel(uploaded_file)
+            except Exception:
+                st.error("Error reading the uploaded Excel file. Please verify it is a valid .xlsx or .xls.")
+                return None
     
     @staticmethod
     def merge_and_save(uploaded_file, target_path: str):
         """
-        Merge uploaded data with existing data and save to disk
+        Merge uploaded data with existing data and save to the active backend.
         """
         try:
-            # Load new data
-            uploaded_file.seek(0)
-            upload_ext = DataManager._get_excel_extension(getattr(uploaded_file, "name", ""))
-            if upload_ext not in [".xlsx", ".xls"]:
-                st.error("Unsupported file type. Please upload a .xlsx or .xls file.")
+            new_df = DataManager._read_uploaded_excel(uploaded_file)
+            if new_df is None:
                 return False
-            upload_engine = DataManager._get_excel_engine(upload_ext)
-            try:
-                new_df = pd.read_excel(uploaded_file, engine=upload_engine)
-            except Exception:
-                uploaded_file.seek(0)
-                try:
-                    new_df = pd.read_excel(uploaded_file)
-                except Exception:
-                    st.error("Error reading the uploaded Excel file. Please verify it is a valid .xlsx or .xls.")
-                    return False
-            
+
+            # Snowflake-specific write path: MERGE into configured table by row hash.
+            if _is_snowflake_backend():
+                repository = _get_snowflake_repository()
+                source_file = getattr(uploaded_file, "name", "uploaded_file")
+                repository.upsert_dataframe(new_df, source_file=source_file)
+                return True
+
+            # Local filesystem write path.
             # Check if target file exists
             if os.path.exists(target_path):
                 try:
@@ -1122,6 +1176,21 @@ class DataManager:
             st.error(f"Error saving data: {str(e)}")
             return False
 
+    @staticmethod
+    def source_has_data(target_path: str) -> bool:
+        """Check whether the active backend currently has readable data."""
+        if _is_snowflake_backend():
+            repository = _get_snowflake_repository()
+            return repository.has_data()
+        return os.path.exists(target_path)
+
+    @staticmethod
+    def get_source_token(target_path: str) -> str:
+        """Return logical source token used by cached loaders."""
+        if _is_snowflake_backend():
+            return SNOWFLAKE_SOURCE_TOKEN
+        return target_path
+
 # ============================================================================
 # DATA LOADING & PROCESSING PIPELINE
 # ============================================================================
@@ -1161,6 +1230,10 @@ def _restore_data_file_from_backup(target_path: str) -> bool:
     """
     Restore the primary data file from its backup if the backup is valid.
     """
+    if _is_snowflake_backend():
+        # Snowflake-specific: backup restore is a filesystem-only concern.
+        return False
+
     backup_path = _get_backup_path(target_path)
     if not os.path.exists(backup_path):
         return False
@@ -1185,8 +1258,13 @@ def _restore_data_file_from_backup(target_path: str) -> bool:
 
 def _get_data_source_signature(path: str) -> str:
     """
-    Build a deterministic signature for cache invalidation based on file metadata.
+    Build a deterministic signature for cache invalidation.
+    Uses file metadata in local mode and Snowflake table state in Snowflake mode.
     """
+    if _is_snowflake_backend():
+        repository = _get_snowflake_repository()
+        return repository.get_source_signature()
+
     try:
         stat = os.stat(path)
     except OSError:
@@ -1291,11 +1369,17 @@ def load_and_process_data(
     Complete data processing pipeline
     Returns: (raw_df, daily_df, employee_metrics_df, weekly_overtime_df, monthly_overtime_df)
     """
-    if not data_source_path or not os.path.exists(data_source_path):
-        raise FileNotFoundError("Attendance data file not found.")
+    if _is_snowflake_backend():
+        # Snowflake-specific read path: hydrate source rows from Snowflake table.
+        repository = _get_snowflake_repository()
+        raw_df = repository.fetch_all_rows()
+        if raw_df is None or raw_df.empty:
+            raise FileNotFoundError("Attendance data not found in Snowflake table.")
+    else:
+        if not data_source_path or not os.path.exists(data_source_path):
+            raise FileNotFoundError("Attendance data file not found.")
+        raw_df = _read_excel_file(data_source_path)
 
-    # Load data
-    raw_df = _read_excel_file(data_source_path)
     _validate_raw_df(raw_df)
     
     # Phase 1: Data Cleaning
@@ -3455,6 +3539,21 @@ def main():
     # FILE MANAGEMENT & PERSISTENCE
     st.sidebar.markdown("---")
     st.sidebar.subheader("\U0001F4CA Data Management")
+    try:
+        active_backend = _resolve_data_backend()
+    except Exception as backend_error:
+        st.sidebar.error(f"Data backend configuration error: {backend_error}")
+        required_env = ", ".join(get_required_snowflake_env_vars())
+        st.sidebar.caption(f"Required Snowflake env vars: {required_env}")
+        st.stop()
+
+    if active_backend == "SNOWFLAKE":
+        # Snowflake-specific UI context for operational clarity.
+        st.sidebar.caption("Active backend: Snowflake")
+        st.sidebar.caption(f"Target table: {Config.SNOWFLAKE_TABLE.upper()}")
+    else:
+        st.sidebar.caption("Active backend: Local Excel file")
+
     uploaded_file = st.sidebar.file_uploader("Update Data Source", type=['xlsx', 'xls'])
     
     data_source = None
@@ -3466,15 +3565,23 @@ def main():
         if merge_ok:
             st.sidebar.success("\u2705 Data updated successfully!")
             _clear_all_caches()
-            data_source = Config.DATA_FILE_PATH
+            data_source = DataManager.get_source_token(Config.DATA_FILE_PATH)
         else:
             st.stop()
-    # 2. Check for existing persistent file
-    elif os.path.exists(Config.DATA_FILE_PATH):
-        data_source = Config.DATA_FILE_PATH
+    # 2. Check for existing persistent source in active backend
+    else:
+        try:
+            if DataManager.source_has_data(Config.DATA_FILE_PATH):
+                data_source = DataManager.get_source_token(Config.DATA_FILE_PATH)
+        except Exception as source_error:
+            st.error(f"Error checking data source: {source_error}")
+            st.stop()
     
     if data_source is None:
-        st.info("Welcome! Please upload an Excel file in the sidebar to initialize the dashboard.")
+        if active_backend == "SNOWFLAKE":
+            st.info("No attendance data found in Snowflake. Upload an Excel file in the sidebar to initialize the table.")
+        else:
+            st.info("Welcome! Please upload an Excel file in the sidebar to initialize the dashboard.")
         st.stop()
     
     # Load data (cache-aware, defensive against corrupted cache payloads)
@@ -3497,8 +3604,10 @@ def main():
         message = str(e)
         if _is_cache_corruption_error(message):
             _clear_all_caches()
-            backup_restored = _restore_data_file_from_backup(data_source)
+            backup_restored = _restore_data_file_from_backup(data_source) if active_backend == "LOCAL" else False
             if backup_restored:
+                source_signature = _get_data_source_signature(data_source)
+            elif active_backend == "SNOWFLAKE":
                 source_signature = _get_data_source_signature(data_source)
             try:
                 with st.spinner("Rebuilding cached data..."):
@@ -3517,10 +3626,16 @@ def main():
             except Exception as retry_error:
                 retry_text = str(retry_error)
                 if _is_cache_corruption_error(retry_text):
-                    st.error(
-                        "Error loading data: Data file appears corrupted. "
-                        "Please upload a fresh Excel file from the Data Management panel."
-                    )
+                    if active_backend == "SNOWFLAKE":
+                        st.error(
+                            "Error loading data: Cached payload rebuild failed for Snowflake source. "
+                            "Please upload a fresh Excel file from the Data Management panel."
+                        )
+                    else:
+                        st.error(
+                            "Error loading data: Data file appears corrupted. "
+                            "Please upload a fresh Excel file from the Data Management panel."
+                        )
                 else:
                     st.error(f"Error loading data: {retry_text}")
                 st.stop()
